@@ -79,5 +79,10 @@
     "method": "kalman",
     "process_noise": 10000.0,
     "measurement_noise": 25.0
+  },
+  "head_profile": {
+    "pitch": -1.9189966117944524,
+    "yaw": 2.7790919158447718,
+    "roll": 0.9559235859881228
   }
 }
