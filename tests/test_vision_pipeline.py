@@ -1,0 +1,155 @@
+import importlib
+from queue import Queue
+from threading import Event, Thread
+from time import sleep
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+
+import numpy as np
+
+import main as app
+from core.calibration import CalibrationSample, TrackingAdapter
+from core.vision_pipeline import VisionPipeline
+from core import vision_processor
+
+
+class VisionProcessorTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.matrix = np.array([[640, 0, 320], [0, 640, 240], [0, 0, 1]], dtype=float)
+        self.distortion = np.zeros((4, 1))
+        self.mesh = Mock()
+        self.processor = vision_processor.VisionProcessor(face_mesh=self.mesh)
+        self.addCleanup(self.processor.close)
+
+    def test_import_does_not_open_camera_or_start_face_mesh(self):
+        with patch("core.camera.Camera") as camera, patch("mediapipe.solutions.face_mesh.FaceMesh") as mesh:
+            importlib.reload(vision_processor)
+        camera.assert_not_called()
+        mesh.assert_not_called()
+
+    def test_no_face_publishes_invalid_state_and_discards_previous_pose(self):
+        self.mesh.process.return_value = SimpleNamespace(multi_face_landmarks=None)
+        self.processor.prev_rvec = self.processor.prev_tvec = np.ones((3, 1))
+        sample = self.processor.process(self.frame, self.matrix, self.distortion, timestamp=12.0)
+        self.assertFalse(sample.tracking_valid)
+        self.assertFalse(sample.eyes_open)
+        self.assertEqual(sample.timestamp, 12.0)
+        self.assertIsNone(self.processor.prev_rvec)
+
+    def test_pupil_midpoint_and_pose_are_available_in_camera_pixels(self):
+        landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
+        landmarks[468] = SimpleNamespace(x=0.4, y=0.45)
+        landmarks[473] = SimpleNamespace(x=0.6, y=0.55)
+        self.mesh.process.return_value = SimpleNamespace(
+            multi_face_landmarks=[SimpleNamespace(landmark=landmarks)]
+        )
+        for eyes_open in (True, False):
+            with self.subTest(eyes_open=eyes_open), patch.object(
+                vision_processor, "estimate_head_pose", return_value=(2, -1, 3, np.zeros((3, 1)), np.ones((3, 1)))
+            ), patch.object(vision_processor, "eyes_are_open", return_value=eyes_open):
+                sample = self.processor.process(self.frame, self.matrix, self.distortion, timestamp=15.0)
+                self.assertEqual((sample.eye_x, sample.eye_y), (320.0, 240.0))
+                self.assertEqual((sample.pitch, sample.yaw, sample.roll), (2.0, -1.0, 3.0))
+                self.assertTrue(sample.tracking_valid)
+                self.assertEqual(sample.eyes_open, eyes_open)
+
+    def test_eye_closure_detection_uses_both_eyes(self):
+        landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
+        for indices in ((33, 160, 158, 133, 153, 144), (263, 387, 385, 362, 380, 373)):
+            points = ((0.2, 0.5), (0.25, 0.45), (0.35, 0.45), (0.4, 0.5), (0.35, 0.55), (0.25, 0.55))
+            for index, (x, y) in zip(indices, points):
+                landmarks[index] = SimpleNamespace(x=x, y=y)
+        self.assertTrue(vision_processor.eyes_are_open(landmarks, 640, 480))
+        for index in (160, 158, 153, 144):
+            landmarks[index].y = 0.5
+        self.assertFalse(vision_processor.eyes_are_open(landmarks, 640, 480))
+
+    def test_processing_worker_delivers_sample_to_the_adapter(self):
+        frames = Queue()
+        frames.put((20.0, self.frame, self.matrix, self.distortion))
+        adapter = TrackingAdapter()
+        stop = Event()
+        errors = Queue()
+        processor = Mock()
+        processor.__enter__ = Mock(return_value=processor)
+        processor.__exit__ = Mock()
+        processor.process.return_value = CalibrationSample(320, 240, 2, -1, 3, timestamp=20.0)
+        worker = Thread(target=vision_processor.process_frames, args=(frames, adapter, stop, errors), kwargs={"processor_factory": lambda: processor})
+        worker.start()
+        try:
+            sample = adapter.samples.get(timeout=2)
+            self.assertEqual(sample, processor.process.return_value)
+            self.assertTrue(errors.empty())
+        finally:
+            stop.set()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+
+
+class VisionPipelineTests(unittest.TestCase):
+    def test_camera_and_vision_workers_deliver_data_and_release_resources(self):
+        adapter = TrackingAdapter()
+        camera = Mock()
+        camera.camera_matrix = np.eye(3)
+        camera.dist_coeffs = np.zeros((4, 1))
+        camera.__enter__ = Mock(return_value=camera)
+        camera.__exit__ = Mock()
+
+        def read():
+            sleep(0.01)
+            return np.zeros((20, 20, 3), dtype=np.uint8)
+
+        camera.read.side_effect = read
+        processor = Mock()
+        processor.__enter__ = Mock(return_value=processor)
+        processor.__exit__ = Mock()
+        processor.process.side_effect = lambda frame, matrix, distortion, timestamp: CalibrationSample(10, 10, 0, 0, 0, timestamp=timestamp)
+        camera_factory = Mock(return_value=camera)
+        pipeline = VisionPipeline(adapter, camera_index=2, camera_factory=camera_factory, processor_factory=lambda: processor)
+        pipeline.start()
+        try:
+            sample = adapter.samples.get(timeout=2)
+            self.assertTrue(sample.tracking_valid)
+            self.assertGreater(sample.timestamp, 0)
+            self.assertTrue(pipeline.errors.empty())
+        finally:
+            pipeline.stop()
+        camera_factory.assert_called_once_with(index=2)
+        camera.__exit__.assert_called_once()
+        processor.__exit__.assert_called_once()
+        self.assertTrue(all(not worker.is_alive() for worker in pipeline.threads))
+
+    def test_camera_failure_is_reported_and_stops_workers(self):
+        processor = Mock()
+        processor.__enter__ = Mock(return_value=processor)
+        processor.__exit__ = Mock()
+        pipeline = VisionPipeline(
+            TrackingAdapter(), camera_factory=Mock(side_effect=RuntimeError("Camera unavailable")),
+            processor_factory=lambda: processor,
+        )
+        pipeline.start()
+        try:
+            self.assertIn("Camera unavailable", pipeline.errors.get(timeout=2))
+        finally:
+            pipeline.stop()
+        self.assertTrue(pipeline.stop_event.is_set())
+        self.assertTrue(all(not worker.is_alive() for worker in pipeline.threads))
+
+    def test_main_starts_pipeline_and_stops_it_even_when_ui_fails(self):
+        with patch.object(app, "CalibrationWindow") as window_factory, patch.object(app, "VisionPipeline") as pipeline_factory:
+            window = window_factory.return_value
+            window._closed = False
+            window.mainloop.side_effect = RuntimeError("UI failure")
+            with self.assertRaisesRegex(RuntimeError, "UI failure"):
+                app.main(camera_index=2)
+            pipeline_factory.return_value.start.assert_called_once()
+            pipeline_factory.return_value.stop.assert_called_once()
+            window.close.assert_called_once()
+            self.assertIs(window_factory.call_args.kwargs["adapter"], pipeline_factory.call_args.args[0])
+            self.assertEqual(window_factory.call_args.kwargs["coordinate_space"], "camera_pixels")
+
+
+if __name__ == "__main__":
+    unittest.main()
