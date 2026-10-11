@@ -8,11 +8,12 @@ from core.vision_processor import process_frames
 
 
 class VisionPipeline:
-    def __init__(self, adapter, camera_index=0, camera_factory=None, processor_factory=None):
+    def __init__(self, adapter, camera_index=0, camera_factory=None, processor_factory=None, freeze_duration=0.5):
         self.adapter = adapter
         self.camera_index = camera_index
         self.camera_factory = camera_factory if camera_factory is not None else Camera
         self.processor_factory = processor_factory
+        self.freeze_duration = freeze_duration
         self.frames = Queue(maxsize=2)
         self.errors = Queue()
         self.stop_event = Event()
@@ -25,7 +26,10 @@ class VisionPipeline:
             Thread(
                 target=process_frames,
                 args=(self.frames, self.adapter, self.stop_event, self.errors),
-                kwargs={"processor_factory": self.processor_factory},
+                kwargs={
+                    "processor_factory": self.processor_factory,
+                    "freeze_duration": self.freeze_duration,
+                },
                 name="vision-processing", daemon=True,
             ),
             Thread(target=self._capture_frames, name="camera-capture", daemon=True),

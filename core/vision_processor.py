@@ -116,11 +116,11 @@ class VisionProcessor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-def process_frames(frames, adapter, stop_event, errors, processor_factory=None):
+def process_frames(frames, adapter, stop_event, errors, processor_factory=None, freeze_duration=0.5):
     factory = processor_factory if processor_factory is not None else VisionProcessor
     
     # 1. Build the mouse object here for the main app pipeline
-    my_mouse = mouse_controller.MouseController()
+    my_mouse = mouse_controller.MouseController(freeze_duration=freeze_duration)
     
     try:
         with factory() as processor:
@@ -143,9 +143,9 @@ def process_frames(frames, adapter, stop_event, errors, processor_factory=None):
         errors.put(f"Vision processing failed: {error}")
         stop_event.set()
 
-def run_preview():
+def run_preview(freeze_duration=0.5):
     processor = VisionProcessor()
-    my_mouse = mouse_controller.MouseController()
+    my_mouse = mouse_controller.MouseController(freeze_duration=freeze_duration)
     
     try:
         cam = Camera()
