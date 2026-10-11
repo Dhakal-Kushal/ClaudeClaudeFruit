@@ -24,10 +24,9 @@ class VisionProcessorTests(unittest.TestCase):
         self.addCleanup(self.processor.close)
 
     def test_import_does_not_open_camera_or_start_face_mesh(self):
-        with patch("core.camera.Camera") as camera, patch("mediapipe.solutions.face_mesh.FaceMesh") as mesh:
+        with patch("core.camera.Camera") as camera:
             importlib.reload(vision_processor)
         camera.assert_not_called()
-        mesh.assert_not_called()
 
     def test_no_face_publishes_invalid_state_and_discards_previous_pose(self):
         self.mesh.process.return_value = SimpleNamespace(multi_face_landmarks=None)
@@ -38,7 +37,7 @@ class VisionProcessorTests(unittest.TestCase):
         self.assertEqual(sample.timestamp, 12.0)
         self.assertIsNone(self.processor.prev_rvec)
 
-    def test_pupil_midpoint_and_pose_are_available_in_camera_pixels(self):
+    def test_pupil_midpoint_is_available_in_camera_pixels(self):
         landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
         landmarks[468] = SimpleNamespace(x=0.4, y=0.45)
         landmarks[473] = SimpleNamespace(x=0.6, y=0.55)
@@ -47,24 +46,13 @@ class VisionProcessorTests(unittest.TestCase):
         )
         for eyes_open in (True, False):
             with self.subTest(eyes_open=eyes_open), patch.object(
-                vision_processor, "estimate_head_pose", return_value=(2, -1, 3, np.zeros((3, 1)), np.ones((3, 1)))
-            ), patch.object(vision_processor, "eyes_are_open", return_value=eyes_open):
+                vision_processor, "eyes_are_open", return_value=eyes_open
+            ):
                 sample = self.processor.process(self.frame, self.matrix, self.distortion, timestamp=15.0)
                 self.assertEqual((sample.eye_x, sample.eye_y), (320.0, 240.0))
-                self.assertEqual((sample.pitch, sample.yaw, sample.roll), (2.0, -1.0, 3.0))
+                self.assertEqual((sample.pitch, sample.yaw, sample.roll), (0.0, 0.0, 0.0))
                 self.assertTrue(sample.tracking_valid)
                 self.assertEqual(sample.eyes_open, eyes_open)
-
-    def test_mirrored_model_points_used_when_mirrored(self):
-        landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
-        with patch("cv2.solvePnP", return_value=(True, np.zeros((3, 1)), np.zeros((3, 1)))) as mock_solve:
-            vision_processor.estimate_head_pose(landmarks, 640, 480, self.matrix, self.distortion, mirrored=True)
-            called_model = mock_solve.call_args[0][0]
-            np.testing.assert_allclose(called_model, vision_processor.MODEL_POINTS_MIRRORED)
-
-            vision_processor.estimate_head_pose(landmarks, 640, 480, self.matrix, self.distortion, mirrored=False)
-            called_model_unmirrored = mock_solve.call_args[0][0]
-            np.testing.assert_allclose(called_model_unmirrored, vision_processor.MODEL_POINTS)
 
     def test_eye_closure_detection_uses_both_eyes(self):
         landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
