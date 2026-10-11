@@ -10,6 +10,7 @@ try:
 except ImportError:
     mouse = None
 
+from core.calibration import angle_delta
 from core.gaze_mapper import GazeMapper
 from core.math_filters import KalmanFilter2D
 
@@ -27,6 +28,9 @@ class MouseController:
             self.mapper = None
 
         settings = profile.get("gesture_settings", {})
+        self.tilt_threshold = settings.get("trigger_degrees", 15.0)
+        self.reset_threshold = settings.get("release_degrees", 7.5)
+        self.max_roll_degrees = settings.get("max_roll_degrees", 25.0)
         cooldown = settings.get("cooldown_ms", 500)
         self.freeze_duration = (cooldown / 1000.0) if cooldown else freeze_duration
         self.sensitivity = 30
@@ -43,8 +47,10 @@ class MouseController:
         process_noise = smoothing.get("process_noise", 10000.0)
         measurement_noise = smoothing.get("measurement_noise", 25.0)
         self.kalman = KalmanFilter2D(process_noise=process_noise, measurement_noise=measurement_noise)
+        self.neutral_roll = profile.get("neutral_head", {}).get("roll", 0.0)
         self.last_click_time = 0.0
         self.last_sample_time = None
+        self.debounce_flag = False
         self.wink_debounce_flag = False
         self.freeze_pos = None
         self.stop_event = Event()
@@ -138,15 +144,24 @@ class MouseController:
                 logging.exception("Error in mouse controller update: %s", error)
 
     def update(self, sample):
-        if not sample.tracking_valid or not sample.eyes_open:
+        if not sample.tracking_valid:
             self.kalman.reset()
             self.last_sample_time = None
+            return
+        if not sample.eyes_open:
+            self.kalman.reset()
+            self.last_sample_time = None
+            self.winkClick(getattr(sample, "left_winking", False), getattr(sample, "right_winking", False))
             return
 
         if self.mapper is not None:
             screen_x, screen_y = self.mapper.map_coordinates(sample.eye_x, sample.eye_y)
-            dt = (sample.timestamp - self.last_sample_time) if self.last_sample_time is not None else None
-            if dt is not None and (dt <= 0 or not math.isfinite(dt) or dt > 1.0):
+            if self.last_sample_time is not None:
+                dt = sample.timestamp - self.last_sample_time
+                if dt <= 0 or not math.isfinite(dt) or dt > 1.0:
+                    self.kalman.reset()
+                    dt = None
+            else:
                 dt = None
             smooth_x, smooth_y = self.kalman.update(screen_x, screen_y, dt=dt)
             self.last_sample_time = sample.timestamp
@@ -156,10 +171,29 @@ class MouseController:
         else:
             smooth_x, smooth_y = sample.eye_x, sample.eye_y
 
+        d_roll = angle_delta([sample.roll], [self.neutral_roll])[0]
+        self.headClick(d_roll)
         self.winkClick(getattr(sample, "left_winking", False), getattr(sample, "right_winking", False))
 
         if not self.is_frozen and self.mapper is not None:
             self.move(int(smooth_x), int(smooth_y), absolute=True)
+
+    def headClick(self, d_roll):
+        current_time = time.time()
+        if abs(d_roll) > self.max_roll_degrees:
+            self.debounce_flag = True
+            return
+        if not self.debounce_flag:
+            if self.tilt_threshold < d_roll <= self.max_roll_degrees:
+                self._trigger_click("double_left")
+                self.last_click_time = current_time
+                self.debounce_flag = True
+            elif -self.max_roll_degrees <= d_roll < -self.tilt_threshold:
+                self._trigger_click("left")
+                self.last_click_time = current_time
+                self.debounce_flag = True
+        elif abs(d_roll) < self.reset_threshold:
+            self.debounce_flag = False
 
     def winkClick(self, left_winking, right_winking):
         current_time = time.time()

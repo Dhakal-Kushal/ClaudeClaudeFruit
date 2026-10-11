@@ -84,19 +84,26 @@ class Camera:
     def list_available_cameras(cls, max_to_test=6):
         return list_available_cameras(max_to_test)
 
-    def __init__(self, index=0, width=None, height=None, flip=True):
+    def __init__(self, index=0, width=None, height=None, flip=True, *, backend=None, fps=None, fourcc=None):
 
-        self._cap = cv2.VideoCapture(index)
+        backend = (cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY) if backend is None else backend
+        self.index = index
+        self._cap = cv2.VideoCapture(index, backend)
         if not self._cap.isOpened():
+            self._cap.release()
             raise RuntimeError(
                 f"Could not open camera {index}. Check that it is plugged in, "
                 "not being used by another app, and try a different index."
             )
 
+        if fourcc is not None:
+            self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         if width is not None:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height is not None:
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if fps is not None:
+            self._cap.set(cv2.CAP_PROP_FPS, fps)
 
         self.flip = flip
         self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -120,7 +127,28 @@ class Camera:
         success, frame = self._cap.read()
         if not success:
             return None
+        if frame is None:
+            return None
+        self.height, self.width = frame.shape[:2]
+        self.camera_matrix = np.array(
+            [[self.width, 0, self.width / 2], [0, self.width, self.height / 2], [0, 0, 1]],
+            dtype=np.float64,
+        )
         return cv2.flip(frame, 1) if self.flip else frame
+
+    def get_metadata(self):
+        """Negotiated settings; dimensions reflect the last successful frame."""
+        def optional_property(prop):
+            value = float(self._cap.get(prop))
+            return value if np.isfinite(value) and value > 0 else None
+
+        return {
+            "index": self.index, "flip": self.flip,
+            "width": self.width, "height": self.height,
+            "backend": int(self._cap.get(cv2.CAP_PROP_BACKEND)),
+            "fps": optional_property(cv2.CAP_PROP_FPS),
+            "fourcc": optional_property(cv2.CAP_PROP_FOURCC),
+        }
 
     def frames(self):
         """Yield frames until the camera stops giving them."""
@@ -136,7 +164,7 @@ class Camera:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
 

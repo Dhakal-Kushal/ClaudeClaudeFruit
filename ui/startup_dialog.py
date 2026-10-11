@@ -2,6 +2,7 @@ from pathlib import Path
 import customtkinter as ctk
 
 from core.camera import list_available_cameras
+from core.calibration import validate_profile, EYE_RELATIVE_COORDINATE_SPACE
 
 BACKGROUND = "#10151e"
 SURFACE = "#192230"
@@ -185,9 +186,15 @@ class StartupDialog(ctk.CTk):
                 self.camera_var.set(self.cameras[0]["label"])
 
     def _choose_track(self):
-        if not self.profile:
+        try:
+            validate_profile(self.profile, require_validation=True)
+            if self.profile["mapping"]["coordinate_space"] != EYE_RELATIVE_COORDINATE_SPACE:
+                raise ValueError("Old gaze measurements")
+            if self.profile["camera"]["index"] != self.camera_index:
+                raise ValueError("A different camera is selected")
+        except (KeyError, TypeError, ValueError, IndexError):
             self.status_label.configure(
-                text="Calibration file is not full yet. Please select Redo Calibration first.",
+                text="Calibration file is not full yet or does not match this camera. Please select Redo Calibration first.",
                 text_color="#f5b492",
             )
             return

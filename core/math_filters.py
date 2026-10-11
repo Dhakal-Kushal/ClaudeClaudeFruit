@@ -1,4 +1,91 @@
+from collections import deque
+
 import numpy as np
+
+
+def validate_calibration_points(points):
+    """Validate four ordered corners followed by a strictly interior center."""
+    points = np.array(points, dtype=float, copy=True)
+    if points.shape != (5, 2) or not np.isfinite(points).all():
+        raise ValueError("Calibration needs five finite 2D points")
+    scale = float(np.ptp(points[:4], axis=0).max())
+    if scale <= 0:
+        raise ValueError("Calibration points overlap; recalibrate")
+
+    corners = (points[:4] - points[4]) / scale
+    following = np.roll(corners, -1, axis=0)
+    edges = following - corners
+    next_edges = np.roll(edges, -1, axis=0)
+    areas = corners[:, 0] * following[:, 1] - corners[:, 1] * following[:, 0]
+    turns = edges[:, 0] * next_edges[:, 1] - edges[:, 1] * next_edges[:, 0]
+    tolerance = 1e-10
+    if not (
+        ((areas > tolerance).all() and (turns > tolerance).all())
+        or ((areas < -tolerance).all() and (turns < -tolerance).all())
+    ):
+        raise ValueError("Calibration corners must form a convex polygon enclosing the center")
+    bases = np.stack((corners, following), axis=-1)
+    if (np.linalg.cond(bases) > 1e6).any():
+        raise ValueError("Calibration triangles are too narrow; recalibrate")
+    return points
+
+
+class PiecewiseAffineMapping2D:
+    """Continuous interpolation through four corners and a calibrated center.
+
+    Each triangle joins the center to adjacent corners. The same affine maps
+    extend beyond the polygon, so callers can clamp to their display bounds.
+    """
+
+    def __init__(self, source_points, target_points):
+        source = validate_calibration_points(source_points)
+        target = validate_calibration_points(target_points)
+        self._source_center = source[4]
+        self._target_center = target[4]
+        self._source_scale = float(np.ptp(source[:4], axis=0).max())
+        offsets = (source[:4] - self._source_center) / self._source_scale
+        source_bases = np.stack((offsets, np.roll(offsets, -1, axis=0)), axis=-1)
+        self._inverse_bases = np.linalg.inv(source_bases)
+        target_offsets = target[:4] - self._target_center
+        self._target_bases = np.stack(
+            (target_offsets, np.roll(target_offsets, -1, axis=0)), axis=-1
+        )
+
+    def map_coordinates(self, x: float, y: float) -> tuple[float, float]:
+        point = np.asarray([x, y], dtype=float)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            raise ValueError("coordinates must be finite scalars")
+        with np.errstate(over="ignore", invalid="ignore"):
+            offset = (point - self._source_center) / self._source_scale
+            weights = self._inverse_bases @ offset
+            # The containing angular sector has two nonnegative coefficients.
+            # A sum above one extrapolates past its outer calibration edge.
+            sector = int(np.argmax(weights.min(axis=1)))
+            result = self._target_center + self._target_bases[sector] @ weights[sector]
+        if not np.isfinite(result).all():
+            raise ValueError("coordinates exceed the mapping's numeric range")
+        return float(result[0]), float(result[1])
+
+
+class CoordinateAverager2D:
+    """Average the latest N mapped screen-coordinate samples."""
+
+    def __init__(self, window_size: int = 5) -> None:
+        if not isinstance(window_size, (int, np.integer)) or isinstance(window_size, bool) or window_size < 1:
+            raise ValueError("window_size must be a positive integer")
+        self.window_size = int(window_size)
+        self.reset()
+
+    def reset(self) -> None:
+        self._coordinates = deque(maxlen=self.window_size)
+
+    def update(self, x: float, y: float) -> tuple[float, float]:
+        coordinates = np.asarray([x, y], dtype=float)
+        if coordinates.shape != (2,) or not np.isfinite(coordinates).all():
+            raise ValueError("coordinates must be finite scalars")
+        self._coordinates.append(coordinates)
+        average = np.mean(self._coordinates, axis=0)
+        return float(average[0]), float(average[1])
 
 
 class KalmanFilter2D:

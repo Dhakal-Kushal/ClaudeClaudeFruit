@@ -9,13 +9,60 @@ from time import monotonic
 
 import numpy as np
 
+from core.math_filters import validate_calibration_points
+
 
 EYE_TARGETS = ("top_left", "top_right", "bottom_right", "bottom_left", "center")
 CALIBRATION_STEPS = ("neutral_head",) + EYE_TARGETS
+EYE_RELATIVE_COORDINATE_SPACE = "eye_relative_v1"
+GAZE_MAPPING_METHOD = "piecewise_affine_v1"
+
+
+def validate_camera_metadata(camera):
+    for key in ("index", "width", "height", "backend"):
+        value = camera[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"Invalid camera {key}")
+    if min(camera["width"], camera["height"]) <= 0 or type(camera["flip"]) is not bool:
+        raise ValueError("Missing capture dimensions or mirror setting")
+    for key in ("fps", "fourcc"):
+        value = camera[key]
+        if value is not None and (isinstance(value, bool) or not np.isfinite(value) or value <= 0):
+            raise ValueError(f"Invalid camera {key}")
+
+
+def camera_compatibility_errors(expected, actual):
+    """Compare negotiated settings, allowing small nominal frame-rate rounding."""
+    try:
+        validate_camera_metadata(expected)
+        validate_camera_metadata(actual)
+    except (KeyError, TypeError, ValueError):
+        return ["Complete camera capture settings are unavailable"]
+    errors = []
+    for key in ("index", "width", "height", "flip", "backend", "fourcc", "fps"):
+        saved, current = expected[key], actual[key]
+        matches = saved == current
+        if key == "fps" and saved is not None and current is not None:
+            matches = abs(saved - current) <= max(0.5, saved * 0.02)
+        if not matches:
+            errors.append(f"{key}: calibrated {saved}, current {current}")
+    return errors
+
+
+def profile_compatibility_errors(profile, monitor, camera_metadata):
+    try:
+        validate_profile(profile, monitor, require_validation=True)
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        return [f"A new calibration and validation are required: {error}"]
+    if profile["mapping"]["coordinate_space"] != EYE_RELATIVE_COORDINATE_SPACE:
+        return ["A new eye-relative calibration is required"]
+    return camera_compatibility_errors(profile["camera"], camera_metadata)
 
 
 @dataclass(frozen=True)
 class CalibrationSample:
+    """Queue payload; the live tracker expresses eye_x/y in eye-width units."""
+
     eye_x: float
     eye_y: float
     pitch: float
@@ -81,25 +128,7 @@ def screen_targets_in_canvas(monitor, canvas_width, canvas_height):
 
 
 def validate_eye_targets(targets):
-    corners = np.array([targets[name] for name in EYE_TARGETS[:4]], dtype=float)
-    center = np.array(targets["center"], dtype=float)
-    if corners.shape != (4, 2) or center.shape != (2,):
-        raise ValueError("Each eye target needs two coordinates")
-    if not np.isfinite(corners).all() or not np.isfinite(center).all():
-        raise ValueError("Eye coordinates must be finite")
-    scale = max(float(np.ptp(corners, axis=0).max()), 1e-6)
-    signs = []
-    for index in range(4):
-        edge = corners[(index + 1) % 4] - corners[index]
-        offset = center - corners[index]
-        cross = edge[0] * offset[1] - edge[1] * offset[0]
-        following = corners[(index + 2) % 4] - corners[(index + 1) % 4]
-        turn = edge[0] * following[1] - edge[1] * following[0]
-        if abs(cross) <= scale**2 * 1e-6 or cross * turn <= 0:
-            raise ValueError("The eye targets overlap or are inconsistent. Keep your head still and retry.")
-        signs.append(np.sign(cross))
-    if len(set(signs)) != 1:
-        raise ValueError("The center eye position must lie inside the four corner positions. Please retry.")
+    validate_calibration_points([targets[name] for name in EYE_TARGETS])
 
 
 class CalibrationSession:
@@ -182,12 +211,12 @@ class CalibrationSession:
         self.step_index += 1
         self.interrupt()
 
-    def build_profile(self, trigger_degrees=15.0, camera=None, coordinate_space="tracker"):
+    def build_profile(self, trigger_degrees=15.0, camera=None, coordinate_space=EYE_RELATIVE_COORDINATE_SPACE):
         if not self.complete:
             raise ValueError("Finish every calibration test before saving")
         validate_eye_targets(self.eye_targets)
         profile = {
-            "schema_version": 1,
+            "schema_version": 2,
             "calibrated": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "monitor": self.monitor,
@@ -195,7 +224,7 @@ class CalibrationSession:
             "eye_targets": self.eye_targets,
             "screen_targets": self.screen_positions,
             "neutral_head": dict(zip(("pitch", "yaw", "roll"), self.neutral_head)),
-            "mapping": {"method": "four_quadrant_linear", "coordinate_space": coordinate_space},
+            "mapping": {"method": GAZE_MAPPING_METHOD, "coordinate_space": coordinate_space},
             "gesture_settings": {
                 "trigger_degrees": float(trigger_degrees),
                 "release_degrees": float(trigger_degrees) / 2,
@@ -212,8 +241,8 @@ class CalibrationSession:
         return profile
 
 
-def validate_profile(profile, monitor=None):
-    if profile["schema_version"] != 1 or profile["calibrated"] is not True:
+def validate_profile(profile, monitor=None, *, require_validation=False):
+    if profile["schema_version"] != 2 or profile["calibrated"] is not True:
         raise ValueError("Calibration is incomplete")
     saved_monitor = profile["monitor"]
     for key in ("width", "height", "x", "y"):
@@ -237,7 +266,7 @@ def validate_profile(profile, monitor=None):
         raise ValueError("Neutral head calibration is incomplete")
     if not isinstance(profile["camera"], dict) or not profile["camera"]:
         raise ValueError("Camera information is missing")
-    if profile["mapping"]["method"] != "four_quadrant_linear" or not profile["mapping"]["coordinate_space"]:
+    if profile["mapping"]["method"] != GAZE_MAPPING_METHOD or not profile["mapping"]["coordinate_space"]:
         raise ValueError("Mapping information is missing")
     gestures = profile["gesture_settings"]
     for key in ("trigger_degrees", "release_degrees", "hold_ms", "cooldown_ms", "click_settle_ms", "closed_eye_frames", "max_roll_degrees"):
@@ -246,24 +275,33 @@ def validate_profile(profile, monitor=None):
     if gestures["release_degrees"] >= gestures["trigger_degrees"] or not isinstance(gestures["bindings"], dict):
         raise ValueError("Gesture settings are inconsistent")
     smoothing = profile["smoothing"]
-    if smoothing["method"] != "kalman":
+    if smoothing["method"] not in ("kalman", "moving_average"):
         raise ValueError("Smoothing settings are missing")
-    for key in ("process_noise", "measurement_noise"):
-        if not np.isfinite(smoothing[key]) or smoothing[key] <= 0:
-            raise ValueError("Invalid smoothing settings")
+    if smoothing["method"] == "kalman":
+        for key in ("process_noise", "measurement_noise"):
+            if not np.isfinite(smoothing[key]) or smoothing[key] <= 0:
+                raise ValueError("Invalid smoothing settings")
+    elif (not isinstance(smoothing.get("window_size"), int)
+          or isinstance(smoothing.get("window_size"), bool) or smoothing["window_size"] < 1):
+        raise ValueError("Invalid moving-average window size")
+    if require_validation:
+        validate_camera_metadata(profile["camera"])
+        # Local import avoids a cycle: validation uses the gaze mapper.
+        from core.validation import validate_report
+        validate_report(profile["validation"], profile)
 
 
 def load_profile(path, monitor=None):
     try:
         profile = json.loads(Path(path).read_text(encoding="utf-8"))
-        validate_profile(profile, monitor)
+        validate_profile(profile, monitor, require_validation=True)
         return profile
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         return None
 
 
 def save_profile(path, profile):
-    validate_profile(profile)
+    validate_profile(profile, require_validation=True)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None

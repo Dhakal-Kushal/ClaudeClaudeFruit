@@ -9,6 +9,23 @@ from core.camera import Camera, get_friendly_camera_names, list_available_camera
 
 class CameraTests(unittest.TestCase):
     @patch("core.camera.cv2.VideoCapture")
+    def test_actual_frame_dimensions_and_unknown_optional_settings_are_reported(self, capture):
+        cap = capture.return_value
+        cap.isOpened.return_value = True
+        cap.get.side_effect = lambda prop: {3: 640, 4: 480, 42: 700}.get(prop, 0)
+        cap.read.return_value = (True, np.zeros((720, 1280, 3), dtype=np.uint8))
+        with Camera(index=2, backend=700, fps=30) as camera:
+            camera.read()
+            metadata = camera.get_metadata()
+            self.assertEqual((metadata["width"], metadata["height"]), (1280, 720))
+            self.assertEqual(metadata["backend"], 700)
+            self.assertIsNone(metadata["fps"])
+            self.assertIsNone(metadata["fourcc"])
+            self.assertEqual(camera.camera_matrix[0, 0], 1280)
+        cap.release.assert_called_once()
+        capture.assert_called_once_with(2, 700)
+
+    @patch("core.camera.cv2.VideoCapture")
     def test_camera_init_and_read(self, mock_cap_cls):
         mock_cap = MagicMock()
         mock_cap.isOpened.return_value = True

@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 import numpy as np
+import main as app
 
 from core.calibration import (
     CalibrationSample,
@@ -19,6 +20,8 @@ from core.calibration import (
 
 
 MONITOR = {"width": 1920, "height": 1080, "x": 0, "y": 0}
+CAMERA = {"index": 0, "width": 640, "height": 480, "backend": 700,
+          "flip": True, "fps": 30.0, "fourcc": None}
 EYES = {
     "neutral_head": (0.5, 0.5),
     "top_left": (0.4, 0.4),
@@ -46,7 +49,42 @@ def completed_session():
     return session
 
 
+def validated_profile(profile=None):
+    """Generate actual synthetic held-out measurements for persistence tests."""
+    from core.validation import ValidationSession
+    from core.math_filters import PiecewiseAffineMapping2D
+    from core.calibration import EYE_TARGETS
+    profile = completed_session().build_profile() if profile is None else profile
+    profile["camera"] = dict(CAMERA)
+    inverse = PiecewiseAffineMapping2D([profile["screen_targets"][key] for key in EYE_TARGETS],
+                                       [profile["eye_targets"][key] for key in EYE_TARGETS])
+    validation = ValidationSession(profile, settle_seconds=0, capture_seconds=.2)
+    timestamp = 100.0
+    while not validation.complete:
+        eye = inverse.map_coordinates(*validation.targets[validation.step])
+        timestamp += .02
+        sample = CalibrationSample(*eye, 2, -1, 3, timestamp=timestamp)
+        validation.accept(sample, now=timestamp)
+    profile["validation"] = validation.build_report()
+    profile["validation"]["accepted"] = True
+    return profile
+
+
 class CalibrationTests(unittest.TestCase):
+    def test_live_tracking_requires_eye_relative_profiles(self):
+        session = completed_session()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            legacy = validated_profile(session.build_profile(coordinate_space="camera_pixels"))
+            save_profile(path, legacy)
+            self.assertIsNone(app.check_profile(path, MONITOR))
+            with self.assertRaisesRegex(ValueError, "eye-relative calibration"):
+                app.run_tracking(0, legacy)
+            current = validated_profile(session.build_profile())
+            self.assertEqual(current["mapping"]["coordinate_space"], "eye_relative_v1")
+            save_profile(path, current)
+            self.assertEqual(app.check_profile(path, MONITOR), current)
+
     def test_six_steps_produce_complete_profile(self):
         session = completed_session()
         profile = session.build_profile(camera={"index": 0}, coordinate_space="normalized_camera")
@@ -55,7 +93,31 @@ class CalibrationTests(unittest.TestCase):
                 np.testing.assert_allclose(profile["eye_targets"][name], eye)
         np.testing.assert_allclose(list(profile["neutral_head"].values()), [2, -1, 3])
         self.assertEqual(profile["screen_targets"]["top_left"], [24, 24])
-        self.assertEqual(profile["mapping"]["method"], "four_quadrant_linear")
+        self.assertEqual(profile["mapping"]["method"], "piecewise_affine_v1")
+
+    def test_old_profile_requires_validation_without_mutating_file(self):
+        profile = completed_session().build_profile()
+        profile["schema_version"] = 1
+        profile["mapping"]["method"] = "four_quadrant_linear"
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            path.write_text(json.dumps(profile))
+            original = path.read_bytes()
+            loaded = load_profile(path, MONITOR)
+            self.assertIsNone(loaded)
+            self.assertEqual(path.read_bytes(), original)
+            profile["mapping"]["coordinate_space"] = "camera_pixels"
+            path.write_text(json.dumps(profile))
+            self.assertIsNone(load_profile(path, MONITOR))
+
+    def test_nearly_collinear_targets_fail_before_saving(self):
+        session = completed_session()
+        session.eye_targets = {
+            name: [point[0], (point[1] - 0.5) * 1e-7]
+            for name, point in session.eye_targets.items()
+        }
+        with self.assertRaisesRegex(ValueError, "narrow|convex"):
+            session.build_profile()
 
     def test_closed_eyes_and_stale_samples_reset_current_capture(self):
         session = CalibrationSession(MONITOR, countdown=0.1)
@@ -106,7 +168,7 @@ class CalibrationTests(unittest.TestCase):
             session.build_profile()
 
     def test_save_load_rejects_missing_data_and_changed_monitor(self):
-        profile = completed_session().build_profile()
+        profile = validated_profile()
         with TemporaryDirectory() as directory:
             path = Path(directory) / "calibration.json"
             self.assertIsNone(load_profile(path))
@@ -121,7 +183,7 @@ class CalibrationTests(unittest.TestCase):
             self.assertIsNone(load_profile(path))
 
     def test_failed_save_preserves_previous_profile(self):
-        profile = completed_session().build_profile()
+        profile = validated_profile()
         with TemporaryDirectory() as directory:
             path = Path(directory) / "calibration.json"
             save_profile(path, profile)
@@ -137,7 +199,7 @@ class CalibrationTests(unittest.TestCase):
         session = completed_session()
         area = {"width": 1904, "height": 1017, "x": 8, "y": 31}
         session.screen_positions = screen_targets(area)
-        profile = session.build_profile()
+        profile = validated_profile(session.build_profile())
         self.assertEqual(profile["screen_targets"]["top_left"], [32, 55])
         with TemporaryDirectory() as directory:
             path = Path(directory) / "calibration.json"
