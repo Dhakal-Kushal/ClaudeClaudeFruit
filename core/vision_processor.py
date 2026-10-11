@@ -153,7 +153,7 @@ class VisionProcessor:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self):
         self.close()
 
 
@@ -248,7 +248,7 @@ def run_preview():
                   if baseline is not None and not calibrating:
                       d_pitch, d_yaw, d_roll = (np.array([pitch, yaw, roll]) - baseline)
                       if mouse_handler:
-                          mouse_handler.update(d_pitch, d_yaw, d_roll)
+                          mouse_handler.headClick(d_pitch, d_yaw, d_roll)
 
                   for i in HEAD_INDICES:
                       cv2.circle(frame, (int(landmarks[i].x * w), int(landmarks[i].y * h)), 3, (0, 0, 255), -1)
