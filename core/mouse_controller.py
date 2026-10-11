@@ -1,3 +1,4 @@
+import logging
 import math
 import time
 from queue import Empty
@@ -60,16 +61,16 @@ class MouseController:
             except Empty:
                 continue
 
-            self.update(sample)
+            try:
+                self.update(sample)
+            except Exception as error:
+                logging.exception("Error in mouse controller update: %s", error)
 
     def update(self, sample):
         if not sample.tracking_valid or not sample.eyes_open:
             self.kalman.reset()
             self.last_sample_time = None
             return
-
-        current_time = time.time()
-        is_frozen = (current_time - self.last_click_time) < self.freeze_duration
 
         screen_x, screen_y = self.mapper.map_coordinates(sample.eye_x, sample.eye_y)
         dt = (sample.timestamp - self.last_sample_time) if self.last_sample_time is not None else None
@@ -81,14 +82,19 @@ class MouseController:
         smooth_x = max(self.mapper.min_x, min(self.mapper.max_x, smooth_x))
         smooth_y = max(self.mapper.min_y, min(self.mapper.max_y, smooth_y))
 
-        if not is_frozen:
-            self.mouse.move(int(smooth_x), int(smooth_y), absolute=True)
-
         d_roll = angle_delta([sample.roll], [self.neutral_roll])[0]
         self.headClick(d_roll)
 
+        is_frozen = (time.time() - self.last_click_time) < self.freeze_duration
+        if not is_frozen:
+            self.mouse.move(int(smooth_x), int(smooth_y), absolute=True)
+
     def headClick(self, d_roll):
         current_time = time.time()
+        if abs(d_roll) > self.max_roll_degrees:
+            self.debounce_flag = True
+            return
+
         if not self.debounce_flag:
             if self.tilt_threshold < d_roll <= self.max_roll_degrees:
                 self.mouse.double_click("left")

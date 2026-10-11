@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Full, Queue
 from tempfile import NamedTemporaryFile
+from threading import Lock
 from time import monotonic
 
 import numpy as np
@@ -30,20 +31,22 @@ class TrackingAdapter:
 
     def __init__(self):
         self.samples = Queue(maxsize=180)
+        self._lock = Lock()
 
     def publish(self, eye_x, eye_y, pitch, yaw, roll, **kwargs):
         sample = CalibrationSample(eye_x, eye_y, pitch, yaw, roll, **kwargs)
-        try:
-            self.samples.put_nowait(sample)
-        except Full:
-            try:
-                self.samples.get_nowait()
-            except Empty:
-                pass
+        with self._lock:
             try:
                 self.samples.put_nowait(sample)
             except Full:
-                pass
+                try:
+                    self.samples.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self.samples.put_nowait(sample)
+                except Full:
+                    pass
 
 
 def angle_delta(angles, baseline):
@@ -260,6 +263,7 @@ def load_profile(path, monitor=None):
 def save_profile(path, profile):
     validate_profile(profile)
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as output:

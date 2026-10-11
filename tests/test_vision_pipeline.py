@@ -55,6 +55,17 @@ class VisionProcessorTests(unittest.TestCase):
                 self.assertTrue(sample.tracking_valid)
                 self.assertEqual(sample.eyes_open, eyes_open)
 
+    def test_mirrored_model_points_used_when_mirrored(self):
+        landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
+        with patch("cv2.solvePnP", return_value=(True, np.zeros((3, 1)), np.zeros((3, 1)))) as mock_solve:
+            vision_processor.estimate_head_pose(landmarks, 640, 480, self.matrix, self.distortion, mirrored=True)
+            called_model = mock_solve.call_args[0][0]
+            np.testing.assert_allclose(called_model, vision_processor.MODEL_POINTS_MIRRORED)
+
+            vision_processor.estimate_head_pose(landmarks, 640, 480, self.matrix, self.distortion, mirrored=False)
+            called_model_unmirrored = mock_solve.call_args[0][0]
+            np.testing.assert_allclose(called_model_unmirrored, vision_processor.MODEL_POINTS)
+
     def test_eye_closure_detection_uses_both_eyes(self):
         landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
         for indices in ((33, 160, 158, 133, 153, 144), (263, 387, 385, 362, 380, 373)):
@@ -138,7 +149,7 @@ class VisionPipelineTests(unittest.TestCase):
         self.assertTrue(all(not worker.is_alive() for worker in pipeline.threads))
 
     def test_main_starts_pipeline_and_stops_it_even_when_ui_fails(self):
-        with patch.object(app, "CalibrationWindow") as window_factory, patch.object(app, "VisionPipeline") as pipeline_factory:
+        with patch.object(app, "check_profile", return_value=None), patch.object(app, "CalibrationWindow") as window_factory, patch.object(app, "VisionPipeline") as pipeline_factory:
             window = window_factory.return_value
             window._closed = False
             window.mainloop.side_effect = RuntimeError("UI failure")
@@ -149,6 +160,54 @@ class VisionPipelineTests(unittest.TestCase):
             window.close.assert_called_once()
             self.assertIs(window_factory.call_args.kwargs["adapter"], pipeline_factory.call_args.args[0])
             self.assertEqual(window_factory.call_args.kwargs["coordinate_space"], "camera_pixels")
+
+    def test_main_runs_tracking_when_profile_exists_and_user_chooses_track(self):
+        sample_profile = {"dummy": True}
+        with patch.object(app, "check_profile", return_value=sample_profile), \
+             patch.object(app, "prompt_startup_choice", return_value="track"), \
+             patch.object(app, "CalibrationWindow") as window_factory, \
+             patch.object(app, "VisionPipeline") as pipeline_factory, \
+             patch.object(app, "MouseController") as controller_factory, \
+             patch.object(app.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            pipeline = pipeline_factory.return_value
+            pipeline.stop_event.is_set.side_effect = [False, False, True]
+            app.main(camera_index=1)
+            window_factory.assert_not_called()
+            pipeline.start.assert_called_once()
+            pipeline.stop.assert_called_once()
+            controller_factory.return_value.start.assert_called_once()
+            controller_factory.return_value.stop.assert_called_once()
+
+    def test_main_runs_calibration_when_profile_exists_and_user_chooses_calibrate(self):
+        sample_profile = {"dummy": True}
+        with patch.object(app, "check_profile", side_effect=[sample_profile, None]), \
+             patch.object(app, "prompt_startup_choice", return_value="calibrate"), \
+             patch.object(app, "CalibrationWindow") as window_factory, \
+             patch.object(app, "VisionPipeline") as pipeline_factory:
+            window = window_factory.return_value
+            window._closed = True
+            app.main(camera_index=0)
+            window_factory.assert_called_once()
+
+    def test_main_exits_cleanly_when_user_chooses_exit(self):
+        sample_profile = {"dummy": True}
+        with patch.object(app, "check_profile", return_value=sample_profile), \
+             patch.object(app, "prompt_startup_choice", return_value="exit"), \
+             patch.object(app, "CalibrationWindow") as window_factory, \
+             patch.object(app, "VisionPipeline") as pipeline_factory:
+            app.main(camera_index=0)
+            window_factory.assert_not_called()
+            pipeline_factory.assert_not_called()
+
+    def test_main_forces_calibration_when_calibrate_flag_passed(self):
+        with patch.object(app, "check_profile", return_value=None), \
+             patch.object(app, "CalibrationWindow") as window_factory, \
+             patch.object(app, "VisionPipeline") as pipeline_factory:
+            window = window_factory.return_value
+            window._closed = True
+            app.main(camera_index=0, calibrate=True)
+            window_factory.assert_called_once()
+            pipeline_factory.return_value.start.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -1,12 +1,14 @@
 import math
 from queue import Empty
 from time import monotonic
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 import cv2
 import mediapipe as mp
 import numpy as np
 import json
 from core.camera import Camera
-from core.calibration import CalibrationSample
+from core.calibration import CalibrationSample, angle_delta
 
 HEAD_INDICES = [1, 152, 33, 263, 61, 291]
 
@@ -18,6 +20,9 @@ MODEL_POINTS = np.array([
   (-150.0,  150.0,  125.0),   
   ( 150.0,  150.0,  125.0),   
 ], dtype=np.float64)
+
+MODEL_POINTS_MIRRORED = MODEL_POINTS.copy()
+MODEL_POINTS_MIRRORED[:, 0] *= -1
 
 AXIS_POINTS = np.array([
   (100, 0, 0),
@@ -39,7 +44,8 @@ def rotation_matrix_to_angles(R):
   return np.degrees([pitch, yaw, roll])
 
 
-def estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec=None, prev_tvec=None):
+def estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec=None, prev_tvec=None, mirrored=False):
+  model_points = MODEL_POINTS_MIRRORED if mirrored else MODEL_POINTS
   image_points = np.array(
       [[landmarks[i].x * w, landmarks[i].y * h] for i in HEAD_INDICES],
       dtype=np.float64,
@@ -47,12 +53,12 @@ def estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec=No
 
   if prev_rvec is None:
       ok, rvec, tvec = cv2.solvePnP(
-          MODEL_POINTS, image_points, camera_matrix, dist_coeffs,
+          model_points, image_points, camera_matrix, dist_coeffs,
           flags=cv2.SOLVEPNP_ITERATIVE,
       )
   else:
       ok, rvec, tvec = cv2.solvePnP(
-          MODEL_POINTS, image_points, camera_matrix, dist_coeffs,
+          model_points, image_points, camera_matrix, dist_coeffs,
           rvec=prev_rvec.copy(), tvec=prev_tvec.copy(),
           useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
       )
@@ -89,9 +95,49 @@ def eyes_are_open(landmarks, width, height, threshold=0.18):
     return True
 
 
+def normalized_iris_position(landmarks, width, height):
+    eye_regions = (
+        ((33, 133), (160, 158), (153, 144)),
+        ((263, 362), (387, 385), (380, 373)),
+    )
+    pupils = sorted(
+        ((landmarks[index].x * width, landmarks[index].y * height) for index in (468, 473)),
+        key=lambda point: point[0],
+    )
+    positions = []
+    for pupil, (corner_indices, upper_indices, lower_indices) in zip(pupils, eye_regions):
+        corners = sorted(
+            ((landmarks[index].x * width, landmarks[index].y * height) for index in corner_indices),
+            key=lambda point: point[0],
+        )
+        upper = np.mean(
+            [(landmarks[index].x * width, landmarks[index].y * height) for index in upper_indices],
+            axis=0,
+        )
+        lower = np.mean(
+            [(landmarks[index].x * width, landmarks[index].y * height) for index in lower_indices],
+            axis=0,
+        )
+        eye_width = corners[1][0] - corners[0][0]
+        eye_height = lower[1] - upper[1]
+        if eye_width <= 1e-6 or eye_height <= 1e-6:
+            raise ValueError("Eye landmarks do not define a usable eye region")
+        positions.append(
+            (
+                (pupil[0] - corners[0][0]) / eye_width,
+                (pupil[1] - (upper[1] + lower[1]) / 2) / eye_height,
+            )
+        )
+    result = np.mean(positions, axis=0)
+    if not np.isfinite(result).all():
+        raise ValueError("Eye landmarks produced invalid gaze coordinates")
+    return float(result[0]), float(result[1])
+
+
 class VisionProcessor:
-    def __init__(self, face_mesh=None):
+    def __init__(self, face_mesh=None, mirrored=True):
         self.face_mesh = face_mesh if face_mesh is not None else _create_face_mesh()
+        self.mirrored = mirrored
         self.prev_rvec = None
         self.prev_tvec = None
 
@@ -122,18 +168,22 @@ class VisionProcessor:
         ):
             self.prev_rvec = self.prev_tvec = None
             return invalid
+
+        open_state = eyes_are_open(landmarks, width, height)
         pose = estimate_head_pose(
             landmarks, width, height, camera_matrix, dist_coeffs,
-            self.prev_rvec, self.prev_tvec,
+            self.prev_rvec, self.prev_tvec, mirrored=self.mirrored,
         )
         if pose is None or not np.isfinite(pose[:3]).all():
             self.prev_rvec = self.prev_tvec = None
             return invalid
+
         pitch, yaw, roll, self.prev_rvec, self.prev_tvec = pose
         eye_x, eye_y = pupils.mean(axis=0)
         return CalibrationSample(
             float(eye_x), float(eye_y), float(pitch), float(yaw), float(roll),
-            eyes_open=eyes_are_open(landmarks, width, height),
+            eyes_open=open_state,
+            tracking_valid=True,
             timestamp=timestamp,
         )
 
@@ -177,7 +227,7 @@ def run_preview():
         session_angles = []
 
         BASELINE_FILE = "calibration_profile.json"
-        BASELINE_KEY = "head_profile"
+        BASELINE_KEY = "neutral_head"
         CALIB_FRAMES = 120 
         baseline = None
         calibrating = False
@@ -208,7 +258,7 @@ def run_preview():
           if results.multi_face_landmarks:
               landmarks = results.multi_face_landmarks[0].landmark
 
-              pose = estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec, prev_tvec)
+              pose = estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec, prev_tvec, mirrored=True)
               if pose is not None:
                   pitch, yaw, roll, rvec, tvec = pose
                   prev_rvec, prev_tvec = rvec, tvec
@@ -229,12 +279,20 @@ def run_preview():
                           except (OSError, ValueError):
                               data = {}
                           data[BASELINE_KEY] = {"pitch": float(baseline[0]), "yaw": float(baseline[1]), "roll": float(baseline[2])}
-                          with open(BASELINE_FILE, "w") as f:
-                              json.dump(data, f, indent=2)
+                          tmp_path = None
+                          try:
+                              target_path = Path(BASELINE_FILE)
+                              with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target_path.parent, suffix=".tmp", delete=False) as f:
+                                  tmp_path = Path(f.name)
+                                  json.dump(data, f, indent=2)
+                              tmp_path.replace(target_path)
+                          finally:
+                              if tmp_path is not None:
+                                  tmp_path.unlink(missing_ok=True)
                           calibrating = False
                           print(f"Baseline saved: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
                   if baseline is not None and not calibrating:
-                      d_pitch, d_yaw, d_roll = (np.array([pitch, yaw, roll]) - baseline)
+                      d_pitch, d_yaw, d_roll = angle_delta([pitch, yaw, roll], baseline)
 
                   for i in HEAD_INDICES:
                       cv2.circle(frame, (int(landmarks[i].x * w), int(landmarks[i].y * h)), 3, (0, 0, 255), -1)

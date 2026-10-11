@@ -9,6 +9,7 @@ from core.mouse_controller import MouseController
 
 
 SAMPLE_PROFILE = {
+    "monitor": {"width": 1920, "height": 1080, "x": 0, "y": 0},
     "screen_targets": {
         "top_left": [0, 0],
         "top_right": [1920, 0],
@@ -56,6 +57,49 @@ class GazeMapperTests(unittest.TestCase):
         sx, sy = self.mapper.map_coordinates(500.0, 400.0)
         self.assertEqual((sx, sy), (1920.0, 1080.0))
 
+    def test_reaches_monitor_edges_beyond_inset_targets(self):
+        profile_with_insets = {
+            "monitor": {"width": 1920, "height": 1080, "x": 0, "y": 0},
+            "screen_targets": {
+                "top_left": [24, 24],
+                "top_right": [1895, 24],
+                "bottom_right": [1895, 1055],
+                "bottom_left": [24, 1055],
+                "center": [960, 540],
+            },
+            "eye_targets": {
+                "top_left": [200.0, 100.0],
+                "top_right": [400.0, 100.0],
+                "bottom_right": [400.0, 300.0],
+                "bottom_left": [200.0, 300.0],
+                "center": [300.0, 200.0],
+            },
+        }
+        mapper = GazeMapper(profile_with_insets)
+        # Eye at top-right dot gets inset coordinate 1895
+        sx, sy = mapper.map_coordinates(400.0, 100.0)
+        self.assertEqual(sx, 1895.0)
+        # Eye looking past top-right dot can reach the full monitor edge (1920)
+        sx, sy = mapper.map_coordinates(450.0, 100.0)
+        self.assertEqual(sx, 1920.0)
+
+    def test_near_zero_delta_protection(self):
+        profile_zero_delta = {
+            "monitor": {"width": 1920, "height": 1080, "x": 0, "y": 0},
+            "screen_targets": SAMPLE_PROFILE["screen_targets"],
+            "eye_targets": {
+                "top_left": [300.1, 100.0],
+                "top_right": [300.2, 100.0],  # dx from center is only 0.2 (< MIN_EYE_DELTA)
+                "bottom_right": [400.0, 300.0],
+                "bottom_left": [200.0, 300.0],
+                "center": [300.0, 200.0],
+            },
+        }
+        mapper = GazeMapper(profile_zero_delta)
+        # Should not raise ZeroDivisionError and should not produce infinite coordinates
+        sx, sy = mapper.map_coordinates(300.5, 100.0)
+        self.assertEqual(sx, 960.0)  # Safe fallback to center x
+
 
 class MouseControllerTests(unittest.TestCase):
     def setUp(self):
@@ -100,6 +144,16 @@ class MouseControllerTests(unittest.TestCase):
         self.controller.update(sample_extreme)
         self.mock_mouse.click.assert_not_called()
         self.mock_mouse.double_click.assert_not_called()
+        self.assertTrue(self.controller.debounce_flag)
+
+    def test_extreme_tilt_returning_past_threshold_does_not_click(self):
+        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 35.0, timestamp=time.time()))
+        self.mock_mouse.click.assert_not_called()
+        self.mock_mouse.double_click.assert_not_called()
+        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 18.0, timestamp=time.time()))
+        self.mock_mouse.click.assert_not_called()
+        self.mock_mouse.double_click.assert_not_called()
+        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 5.0, timestamp=time.time()))
         self.assertFalse(self.controller.debounce_flag)
 
     def test_debounce_resets_after_head_straightens(self):

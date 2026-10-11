@@ -1,6 +1,6 @@
 import logging
 from queue import Empty, Full, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic
 
 from core.camera import Camera
@@ -17,6 +17,7 @@ class VisionPipeline:
         self.errors = Queue()
         self.stop_event = Event()
         self.threads = []
+        self._frame_lock = Lock()
 
     def start(self):
         if self.threads:
@@ -43,17 +44,18 @@ class VisionPipeline:
                     if frame is None:
                         raise RuntimeError("The camera stopped providing video frames")
                     packet = (monotonic(), frame, camera.camera_matrix, camera.dist_coeffs)
-                    try:
-                        self.frames.put_nowait(packet)
-                    except Full:
-                        try:
-                            self.frames.get_nowait()
-                        except Empty:
-                            pass
+                    with self._frame_lock:
                         try:
                             self.frames.put_nowait(packet)
                         except Full:
-                            pass
+                            try:
+                                self.frames.get_nowait()
+                            except Empty:
+                                pass
+                            try:
+                                self.frames.put_nowait(packet)
+                            except Full:
+                                pass
         except Exception as error:
             self.errors.put(f"Camera capture failed: {error}")
             self.stop_event.set()

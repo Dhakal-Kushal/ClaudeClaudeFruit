@@ -22,6 +22,10 @@ class Camera:
         self.flip = flip
         self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if self.width <= 0 or self.height <= 0:
+            success, test_frame = self._cap.read()
+            if success and test_frame is not None:
+                self.height, self.width = test_frame.shape[:2]
 
         # Approximate intrinsics for solvePnP (focal length ~ image width, center
         # principal point). Ignore these if you don't need them.
