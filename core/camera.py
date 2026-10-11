@@ -53,7 +53,7 @@ class Camera:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self):
         self.release()
 
 

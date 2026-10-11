@@ -56,11 +56,6 @@
       533.0
     ]
   },
-  "neutral_head": {
-    "pitch": 17.706857841638634,
-    "yaw": -19.312310773447035,
-    "roll": 177.8552542253339
-  },
   "mapping": {
     "method": "four_quadrant_linear",
     "coordinate_space": "camera_pixels"
