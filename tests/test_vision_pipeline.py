@@ -77,6 +77,20 @@ class VisionProcessorTests(unittest.TestCase):
             landmarks[index].y = 0.5
         self.assertFalse(vision_processor.eyes_are_open(landmarks, 640, 480))
 
+    def test_check_winks_detects_single_eye_closure(self):
+        landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(478)]
+        for indices in ((33, 160, 158, 133, 153, 144), (263, 387, 385, 362, 380, 373)):
+            points = ((0.2, 0.5), (0.25, 0.45), (0.35, 0.45), (0.4, 0.5), (0.35, 0.55), (0.25, 0.55))
+            for index, (x, y) in zip(indices, points):
+                landmarks[index] = SimpleNamespace(x=x, y=y)
+        # Both eyes open
+        self.assertEqual(vision_processor.check_winks(landmarks, 640, 480), (False, False))
+
+        # Close left eye only
+        for index in (160, 158, 153, 144):
+            landmarks[index].y = 0.5
+        self.assertEqual(vision_processor.check_winks(landmarks, 640, 480), (True, False))
+
     def test_processing_worker_delivers_sample_to_the_adapter(self):
         frames = Queue()
         frames.put((20.0, self.frame, self.matrix, self.distortion))

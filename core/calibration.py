@@ -24,6 +24,8 @@ class CalibrationSample:
     eyes_open: bool = True
     tracking_valid: bool = True
     timestamp: float = field(default_factory=monotonic)
+    left_winking: bool = False
+    right_winking: bool = False
 
 
 class TrackingAdapter:

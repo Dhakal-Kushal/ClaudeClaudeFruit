@@ -1,4 +1,3 @@
-import math
 from queue import Empty
 from time import monotonic
 from pathlib import Path
@@ -7,6 +6,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import json
+import math
+from core import mouse_controller
 from core.camera import Camera
 from core.calibration import CalibrationSample, angle_delta
 
@@ -69,7 +70,6 @@ def estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec=No
   pitch, yaw, roll = rotation_matrix_to_angles(rmat)
   return pitch, yaw, roll, rvec, tvec
 
-
 def _create_face_mesh():
     if not hasattr(mp, "solutions"):
         raise RuntimeError("This tracker needs the FaceMesh runtime. Install requirements.txt.")
@@ -79,7 +79,6 @@ def _create_face_mesh():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-
 
 def eyes_are_open(landmarks, width, height, threshold=0.18):
     for indices in ((33, 160, 158, 133, 153, 144), (263, 387, 385, 362, 380, 373)):
@@ -94,6 +93,32 @@ def eyes_are_open(landmarks, width, height, threshold=0.18):
             return False
     return True
 
+LEFT_EYE = (33, 160, 158, 133, 153, 144)
+RIGHT_EYE = (263, 387, 385, 362, 380, 373)
+
+def eye_ratio(landmarks, indices, width, height):
+    """Lid gap divided by eye width. Near 0 = upper lid has reached the lower lid (closed)."""
+    points = np.array(
+        [(landmarks[index].x * width, landmarks[index].y * height) for index in indices]
+    )
+    horizontal = np.linalg.norm(points[0] - points[3])
+    if horizontal <= 1e-6:
+        return None
+    vertical = np.linalg.norm(points[1] - points[5]) + np.linalg.norm(points[2] - points[4])
+    return vertical / (2 * horizontal)
+
+def check_winks(landmarks, width, height, threshold=0.18):
+    """Returns (left_is_winking, right_is_winking)"""
+    left = eye_ratio(landmarks, LEFT_EYE, width, height)
+    right = eye_ratio(landmarks, RIGHT_EYE, width, height)
+    
+    if left is None or right is None:
+        return False, False
+        
+    left_wink = left < threshold and right >= threshold
+    right_wink = right < threshold and left >= threshold
+    
+    return left_wink, right_wink
 
 def normalized_iris_position(landmarks, width, height):
     eye_regions = (
@@ -140,23 +165,32 @@ class VisionProcessor:
         self.mirrored = mirrored
         self.prev_rvec = None
         self.prev_tvec = None
+        self.left_winking = False
+        self.right_winking = False
 
     def process(self, frame, camera_matrix, dist_coeffs, timestamp=None):
         timestamp = monotonic() if timestamp is None else timestamp
+        self.left_winking = False
+        self.right_winking = False
+        
         height, width = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         result = self.face_mesh.process(rgb)
+        
         invalid = CalibrationSample(
-            0, 0, 0, 0, 0, eyes_open=False, tracking_valid=False, timestamp=timestamp
+            0, 0, 0, 0, 0, eyes_open=False, tracking_valid=False, timestamp=timestamp,
+            left_winking=False, right_winking=False,
         )
         if not result.multi_face_landmarks:
             self.prev_rvec = self.prev_tvec = None
             return invalid
+            
         landmarks = result.multi_face_landmarks[0].landmark
         if len(landmarks) < 478:
             self.prev_rvec = self.prev_tvec = None
             return invalid
+            
         pupils = np.array(
             [(landmarks[index].x * width, landmarks[index].y * height) for index in (468, 473)]
         )
@@ -180,11 +214,17 @@ class VisionProcessor:
 
         pitch, yaw, roll, self.prev_rvec, self.prev_tvec = pose
         eye_x, eye_y = pupils.mean(axis=0)
+        
+        # Check both eyes
+        self.left_winking, self.right_winking = check_winks(landmarks, width, height)
+        
         return CalibrationSample(
             float(eye_x), float(eye_y), float(pitch), float(yaw), float(roll),
             eyes_open=open_state,
             tracking_valid=True,
             timestamp=timestamp,
+            left_winking=self.left_winking,
+            right_winking=self.right_winking,
         )
 
     def close(self):
@@ -195,7 +235,6 @@ class VisionProcessor:
 
     def __exit__(self, exc_type=None, exc=None, traceback=None):
         self.close()
-
 
 def process_frames(frames, adapter, stop_event, errors, processor_factory=None):
     factory = processor_factory if processor_factory is not None else VisionProcessor
@@ -211,6 +250,8 @@ def process_frames(frames, adapter, stop_event, errors, processor_factory=None):
                     sample.eye_x, sample.eye_y, sample.pitch, sample.yaw, sample.roll,
                     eyes_open=sample.eyes_open, tracking_valid=sample.tracking_valid,
                     timestamp=sample.timestamp,
+                    left_winking=getattr(sample, "left_winking", False),
+                    right_winking=getattr(sample, "right_winking", False),
                 )
     except Exception as error:
         errors.put(f"Vision processing failed: {error}")
@@ -218,12 +259,13 @@ def process_frames(frames, adapter, stop_event, errors, processor_factory=None):
 
 
 def run_preview():
-    face_mesh = _create_face_mesh()
+    processor = VisionProcessor()
+    my_mouse = mouse_controller.MouseController()
+    
     try:
         cam = Camera()
         print("Real Time Capturing (press ESC to quit, C to calibrate baseline)")
 
-        session_landmarks = []
         session_angles = []
 
         BASELINE_FILE = "calibration_profile.json"
@@ -234,100 +276,86 @@ def run_preview():
         calib_buffer = []
 
         try:
-          with open(BASELINE_FILE) as f:
-              saved = json.load(f)[BASELINE_KEY]
-          baseline = np.array([saved["pitch"], saved["yaw"], saved["roll"]], dtype=float)
+            with open(BASELINE_FILE) as f:
+                saved = json.load(f)[BASELINE_KEY]
+            baseline = np.array([saved["pitch"], saved["yaw"], saved["roll"]], dtype=float)
         except (OSError, ValueError, TypeError, KeyError):
-          baseline = None
+            baseline = None
 
         if baseline is not None:
-          print(f"Loaded baseline: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
+            print(f"Loaded baseline: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
         else:
-          print("No baseline yet. Look straight at the camera and press C.")
+            print("No baseline yet. Look straight at the camera and press C.")
 
         camera_matrix = cam.camera_matrix
         dist_coeffs = cam.dist_coeffs
-        prev_rvec, prev_tvec = None, None
 
         for frame in cam.frames():
-          h, w, _ = frame.shape
+            sample = processor.process(frame, camera_matrix, dist_coeffs)
+            if sample.tracking_valid:
+                cv2.circle(frame, (int(sample.eye_x), int(sample.eye_y)), 4, (0, 255, 0), -1)
+                pitch, yaw, roll = sample.pitch, sample.yaw, sample.roll
+                session_angles.append((pitch, yaw, roll))
 
-          rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-          results = face_mesh.process(rgb_frame)
+                if calibrating:
+                    calib_buffer.append((pitch, yaw, roll))
+                    if len(calib_buffer) % 10 == 0:
+                        print(f"Calibrating... {len(calib_buffer)}/{CALIB_FRAMES}")
+                    if len(calib_buffer) >= CALIB_FRAMES:
+                        baseline = np.median(calib_buffer, axis=0)
+                        try:
+                            with open(BASELINE_FILE) as f:
+                                data = json.load(f)
+                            if not isinstance(data, dict):
+                                data = {}
+                        except (OSError, ValueError):
+                            data = {}
+                        data[BASELINE_KEY] = {"pitch": float(baseline[0]), "yaw": float(baseline[1]), "roll": float(baseline[2])}
+                        tmp_path = None
+                        try:
+                            target_path = Path(BASELINE_FILE)
+                            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target_path.parent, suffix=".tmp", delete=False) as f:
+                                tmp_path = Path(f.name)
+                                json.dump(data, f, indent=2)
+                            tmp_path.replace(target_path)
+                        finally:
+                            if tmp_path is not None:
+                                tmp_path.unlink(missing_ok=True)
+                        calibrating = False
+                        print(f"Baseline saved: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
 
-          if results.multi_face_landmarks:
-              landmarks = results.multi_face_landmarks[0].landmark
+                if processor.prev_rvec is not None and processor.prev_tvec is not None:
+                    axes_2d, _ = cv2.projectPoints(AXIS_POINTS, processor.prev_rvec, processor.prev_tvec, camera_matrix, dist_coeffs)
+                    origin_pt = (int(sample.eye_x), int(sample.eye_y))
+                    for pt, color in zip(axes_2d.reshape(-1, 2), [(0, 0, 255), (0, 255, 0), (255, 0, 0)]):
+                        cv2.line(frame, origin_pt, (int(pt[0]), int(pt[1])), color, 2)
 
-              pose = estimate_head_pose(landmarks, w, h, camera_matrix, dist_coeffs, prev_rvec, prev_tvec, mirrored=True)
-              if pose is not None:
-                  pitch, yaw, roll, rvec, tvec = pose
-                  prev_rvec, prev_tvec = rvec, tvec
+                cv2.putText(frame, f"Pitch: {pitch:6.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Yaw:   {yaw:6.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Roll:  {roll:6.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                  session_angles.append((pitch, yaw, roll))
-                  
-                  if calibrating:
-                      calib_buffer.append((pitch, yaw, roll))
-                      if len(calib_buffer) % 10 == 0:
-                          print(f"Calibrating... {len(calib_buffer)}/{CALIB_FRAMES}")
-                      if len(calib_buffer) >= CALIB_FRAMES:
-                          baseline = np.median(calib_buffer, axis=0)
-                          try:
-                              with open(BASELINE_FILE) as f:
-                                  data = json.load(f)
-                              if not isinstance(data, dict):
-                                  data = {}
-                          except (OSError, ValueError):
-                              data = {}
-                          data[BASELINE_KEY] = {"pitch": float(baseline[0]), "yaw": float(baseline[1]), "roll": float(baseline[2])}
-                          tmp_path = None
-                          try:
-                              target_path = Path(BASELINE_FILE)
-                              with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target_path.parent, suffix=".tmp", delete=False) as f:
-                                  tmp_path = Path(f.name)
-                                  json.dump(data, f, indent=2)
-                              tmp_path.replace(target_path)
-                          finally:
-                              if tmp_path is not None:
-                                  tmp_path.unlink(missing_ok=True)
-                          calibrating = False
-                          print(f"Baseline saved: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
-                  if baseline is not None and not calibrating:
-                      d_pitch, d_yaw, d_roll = angle_delta([pitch, yaw, roll], baseline)
+            my_mouse.winkClick(processor.left_winking, processor.right_winking)
 
-                  for i in HEAD_INDICES:
-                      cv2.circle(frame, (int(landmarks[i].x * w), int(landmarks[i].y * h)), 3, (0, 0, 255), -1)
-
-                  axes_2d, _ = cv2.projectPoints(AXIS_POINTS, rvec, tvec, camera_matrix, dist_coeffs)
-                  nose = (int(landmarks[1].x * w), int(landmarks[1].y * h))
-                  for pt, color in zip(axes_2d.reshape(-1, 2), [(0, 0, 255), (0, 255, 0), (255, 0, 0)]):
-                      cv2.line(frame, nose, (int(pt[0]), int(pt[1])), color, 2)
-
-                  cv2.putText(frame, f"Pitch: {pitch:6.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                  cv2.putText(frame, f"Yaw:   {yaw:6.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                  cv2.putText(frame, f"Roll:  {roll:6.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-          else:
-              prev_rvec, prev_tvec = None, None
-
-          cv2.imshow("Real-Time Head Pose", frame)
-          key = cv2.waitKey(5) & 0xFF
-          if key == 27:
-              break
-          elif key == ord("c"):
-              calibrating = True
-              calib_buffer = []
-              print("Calibrating... hold still and look straight at the camera.")
+            cv2.imshow("Real-Time Tracking", frame)
+            key = cv2.waitKey(5) & 0xFF
+            if key == 27:
+                break
+            elif key == ord("c"):
+                calibrating = True
+                calib_buffer = []
+                print("Calibrating... hold still and look straight at the camera.")
 
         cam.release()
         cv2.destroyAllWindows()
 
         if session_angles:
-          angles = np.array(session_angles)
-          np.save("live_head_angles.npy", angles)
-          print(f"Saved {angles.shape[0]} frames to 'live_head_angles.npy'")
+            angles = np.array(session_angles)
+            np.save("live_head_angles.npy", angles)
+            print(f"Saved {angles.shape[0]} frames to 'live_head_angles.npy'")
         else:
-          print("No angles recorded.")
+            print("No angles recorded.")
     finally:
-        face_mesh.close()
+        processor.close()
 
 
 if __name__ == "__main__":
