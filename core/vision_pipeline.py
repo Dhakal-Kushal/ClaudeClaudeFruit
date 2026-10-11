@@ -2,23 +2,37 @@ import logging
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
+from functools import partial
 
 from core.camera import Camera
-from core.vision_processor import process_frames
+from core.calibration import camera_compatibility_errors, validate_camera_metadata
+from core.vision_processor import VisionProcessor, process_frames
 
 
 class VisionPipeline:
-    def __init__(self, adapter, camera_index=0, camera_factory=None, processor_factory=None, freeze_duration=0.5):
+    def __init__(self, adapter, camera_index=0, camera_factory=None, processor_factory=None,
+                 freeze_duration=0.5, *, capture_settings=None, expected_camera=None):
         self.adapter = adapter
         self.camera_index = camera_index
         self.camera_factory = camera_factory if camera_factory is not None else Camera
-        self.processor_factory = processor_factory
+        self.capture_settings = dict(capture_settings or {})
+        self.expected_camera = dict(expected_camera) if expected_camera else None
+        self.processor_factory = processor_factory or partial(
+            VisionProcessor, mirrored=self.capture_settings.get("flip", True)
+        )
         self.freeze_duration = freeze_duration
         self.frames = Queue(maxsize=2)
         self.errors = Queue()
         self.stop_event = Event()
         self.threads = []
         self._frame_lock = Lock()
+        self._metadata_lock = Lock()
+        self._camera_metadata = None
+        self.camera_ready = Event()
+
+    def get_camera_metadata(self):
+        with self._metadata_lock:
+            return dict(self._camera_metadata) if self._camera_metadata is not None else None
 
     def start(self):
         if self.threads:
@@ -42,11 +56,24 @@ class VisionPipeline:
         try:
             if self.stop_event.is_set():
                 return
-            with self.camera_factory(index=self.camera_index) as camera:
+            with self.camera_factory(index=self.camera_index, **self.capture_settings) as camera:
                 while not self.stop_event.is_set():
                     frame = camera.read()
                     if frame is None:
                         raise RuntimeError("The camera stopped providing video frames")
+                    metadata = camera.get_metadata()
+                    validate_camera_metadata(metadata)
+                    if [metadata["height"], metadata["width"]] != list(frame.shape[:2]):
+                        raise ValueError("Camera metadata does not match captured frame dimensions")
+                    expected = self.get_camera_metadata() or self.expected_camera
+                    if expected is not None:
+                        errors = camera_compatibility_errors(expected, metadata)
+                        if errors:
+                            raise ValueError("Camera settings changed; recalibrate. " + "; ".join(errors))
+                    with self._metadata_lock:
+                        if self._camera_metadata is None:
+                            self._camera_metadata = dict(metadata)
+                    self.camera_ready.set()
                     packet = (monotonic(), frame, camera.camera_matrix, camera.dist_coeffs)
                     with self._frame_lock:
                         try:

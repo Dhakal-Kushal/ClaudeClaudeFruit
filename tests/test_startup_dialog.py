@@ -9,7 +9,8 @@ class StartupDialogTests(unittest.TestCase):
     @patch("customtkinter.CTk.winfo_screenheight", return_value=1080)
     def test_dialog_buttons_set_expected_choice(self, mock_h, mock_w):
         with patch("customtkinter.CTk.destroy"):
-            dialog = StartupDialog(profile={"monitor": {"width": 1920, "height": 1080}})
+            from test_calibration import validated_profile
+            dialog = StartupDialog(profile=validated_profile(), camera_list=[])
             self.assertEqual(dialog.choice, "exit")
 
             dialog._choose_track()
