@@ -5,18 +5,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import json
-
 from core.camera import Camera
 from core.calibration import CalibrationSample
-
-try:
-    from core.mouse_controller import MouseController
-except ImportError:
-    try:
-        from mouse_controller import MouseController
-    except ImportError:
-        MouseController = None
-
 
 HEAD_INDICES = [1, 152, 33, 263, 61, 291]
 
@@ -182,7 +172,6 @@ def run_preview():
     try:
         cam = Camera()
         print("Real Time Capturing (press ESC to quit, C to calibrate baseline)")
-        mouse_handler = MouseController(tilt_threshold=15.0, freeze_duration=0.5) if MouseController else None
 
         session_landmarks = []
         session_angles = []
@@ -244,11 +233,8 @@ def run_preview():
                               json.dump(data, f, indent=2)
                           calibrating = False
                           print(f"Baseline saved: pitch={baseline[0]:.1f} yaw={baseline[1]:.1f} roll={baseline[2]:.1f}")
-
                   if baseline is not None and not calibrating:
                       d_pitch, d_yaw, d_roll = (np.array([pitch, yaw, roll]) - baseline)
-                      if mouse_handler:
-                          mouse_handler.update(d_pitch, d_yaw, d_roll)
 
                   for i in HEAD_INDICES:
                       cv2.circle(frame, (int(landmarks[i].x * w), int(landmarks[i].y * h)), 3, (0, 0, 255), -1)
