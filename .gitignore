@@ -49,3 +49,7 @@ coverage.xml
 Thumbs.db
 Desktop.ini
 agent.md
+
+# Calibration profile
+calibration_profile.json
+calibration_projile.json
