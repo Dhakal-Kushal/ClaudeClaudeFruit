@@ -26,6 +26,7 @@ class CalibrationSample:
     timestamp: float = field(default_factory=monotonic)
     left_winking: bool = False
     right_winking: bool = False
+    is_blinking: bool = False
 
 
 class TrackingAdapter:

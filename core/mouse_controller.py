@@ -44,6 +44,7 @@ class MouseController:
         measurement_noise = smoothing.get("measurement_noise", 25.0)
         self.kalman = KalmanFilter2D(process_noise=process_noise, measurement_noise=measurement_noise)
         self.last_click_time = 0.0
+        self.last_blink_time = 0.0
         self.last_sample_time = None
         self.wink_debounce_flag = False
         self.freeze_pos = None
@@ -52,7 +53,7 @@ class MouseController:
 
     @property
     def is_frozen(self):
-        return (time.time() - self.last_click_time) < self.freeze_duration
+        return (time.time() - max(self.last_click_time, self.last_blink_time)) < self.freeze_duration
 
     def move(self, x, y, absolute=True):
         if not self.is_frozen:
@@ -138,9 +139,22 @@ class MouseController:
                 logging.exception("Error in mouse controller update: %s", error)
 
     def update(self, sample):
-        if not sample.tracking_valid or not sample.eyes_open:
+        if not sample.tracking_valid:
             self.kalman.reset()
             self.last_sample_time = None
+            return
+
+        left_winking = getattr(sample, "left_winking", False)
+        right_winking = getattr(sample, "right_winking", False)
+        is_blink = getattr(sample, "is_blinking", False) or (
+            not sample.eyes_open and not left_winking and not right_winking
+        )
+
+        # Explicit rule: If blinking, freeze mouse for half a second and ignore clicks
+        if is_blink:
+            self.kalman.reset()
+            self.last_sample_time = None
+            self.winkClick(left_winking=False, right_winking=False, is_blinking=True)
             return
 
         if self.mapper is not None:
@@ -156,14 +170,30 @@ class MouseController:
         else:
             smooth_x, smooth_y = sample.eye_x, sample.eye_y
 
-        self.winkClick(getattr(sample, "left_winking", False), getattr(sample, "right_winking", False))
+        self.winkClick(left_winking, right_winking, is_blinking=False)
 
         if not self.is_frozen and self.mapper is not None:
             self.move(int(smooth_x), int(smooth_y), absolute=True)
 
-    def winkClick(self, left_winking, right_winking):
+    def winkClick(self, left_winking=False, right_winking=False, is_blinking=False):
         current_time = time.time()
-        # 1. Left Wink -> Left Click
+
+        # 0. EXPLICIT RULE: Blinking is ignored and never counted as a click.
+        # Freeze the mouse for half a second (freeze_duration) to prevent mouse drag and that's it.
+        if is_blinking or (left_winking and right_winking):
+            self.last_blink_time = current_time
+            self.wink_debounce_flag = True
+            try:
+                self.freeze_pos = self.mouse.get_position()
+            except Exception:
+                self.freeze_pos = None
+            return
+
+        # Suppress any clicks while post-blink freeze is active
+        if (current_time - self.last_blink_time) < self.freeze_duration:
+            return
+
+        # 1. Left Wink -> Single Left Click
         if left_winking and not self.wink_debounce_flag:
             try:
                 self.freeze_pos = self.mouse.get_position()
@@ -186,7 +216,7 @@ class MouseController:
             print("--- DOUBLE LEFT CLICK FIRED ---")
 
         # 3. Release: Both eyes are open, allow next click
-        elif not left_winking and not right_winking:
+        elif not left_winking and not right_winking and not is_blinking:
             self.wink_debounce_flag = False
 
         if not self.is_frozen:
