@@ -39,12 +39,21 @@ class MouseController:
         measurement_noise = smoothing.get("measurement_noise", 25.0)
         self.kalman = KalmanFilter2D(process_noise=process_noise, measurement_noise=measurement_noise)
 
-        self.last_click_time = 0
+        self.last_click_time = 0.0
         self.last_sample_time = None
         self.debounce_flag = False
         self.wink_debounce_flag = False
+        self.freeze_pos = None
         self.stop_event = Event()
         self.thread = None
+
+    @property
+    def is_frozen(self):
+        return (time.time() - self.last_click_time) < self.freeze_duration
+
+    def move(self, x, y, absolute=True):
+        if not self.is_frozen:
+            self.mouse.move(x, y, absolute=absolute)
 
     def start(self):
         """Starts the mouse controller consumer thread."""
@@ -100,9 +109,8 @@ class MouseController:
         self.headClick(d_roll)
         self.winkClick(getattr(sample, "left_winking", False), getattr(sample, "right_winking", False))
 
-        is_frozen = (time.time() - self.last_click_time) < self.freeze_duration
-        if not is_frozen and self.mapper is not None:
-            self.mouse.move(int(smooth_x), int(smooth_y), absolute=True)
+        if not self.is_frozen and self.mapper is not None:
+            self.move(int(smooth_x), int(smooth_y), absolute=True)
 
     def headClick(self, d_roll):
         current_time = time.time()
@@ -112,10 +120,18 @@ class MouseController:
 
         if not self.debounce_flag:
             if self.tilt_threshold < d_roll <= self.max_roll_degrees:
+                try:
+                    self.freeze_pos = self.mouse.get_position()
+                except Exception:
+                    self.freeze_pos = None
                 self.mouse.double_click("left")
                 self.last_click_time = current_time
                 self.debounce_flag = True
             elif -self.max_roll_degrees <= d_roll < -self.tilt_threshold:
+                try:
+                    self.freeze_pos = self.mouse.get_position()
+                except Exception:
+                    self.freeze_pos = None
                 self.mouse.click("left")
                 self.last_click_time = current_time
                 self.debounce_flag = True
@@ -126,6 +142,10 @@ class MouseController:
         current_time = time.time()
         # 1. Left Wink -> Left Click
         if left_winking and not self.wink_debounce_flag:
+            try:
+                self.freeze_pos = self.mouse.get_position()
+            except Exception:
+                self.freeze_pos = None
             self.mouse.click("left")
             self.last_click_time = current_time
             self.wink_debounce_flag = True
@@ -133,6 +153,10 @@ class MouseController:
 
         # 2. Right Wink -> Right Click
         elif right_winking and not self.wink_debounce_flag:
+            try:
+                self.freeze_pos = self.mouse.get_position()
+            except Exception:
+                self.freeze_pos = None
             self.mouse.click("right")
             self.last_click_time = current_time
             self.wink_debounce_flag = True
@@ -141,3 +165,6 @@ class MouseController:
         # 3. Release: Both eyes are open, unlock the door
         elif not left_winking and not right_winking:
             self.wink_debounce_flag = False
+
+        if not self.is_frozen:
+            self.freeze_pos = None
