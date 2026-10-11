@@ -31,13 +31,43 @@ def rotation_matrix_to_angles(rotation):
     return np.degrees([pitch, yaw, roll])
 
 
+def angles_to_rotation_matrix(angles):
+    """Inverse of the Z-Y-X Euler convention used by the pose estimator."""
+    angles = np.asarray(angles, dtype=float)
+    if angles.shape != (3,) or not np.isfinite(angles).all():
+        raise ValueError("Initial head pose needs three finite angles")
+    pitch, yaw, roll = np.deg2rad(angles)
+    cx, cy, cz = np.cos([pitch, yaw, roll])
+    sx, sy, sz = np.sin([pitch, yaw, roll])
+    rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
 def estimate_head_pose(landmarks, width, height, camera_matrix, dist_coeffs,
-                       prev_rvec=None, prev_tvec=None, mirrored=False):
+                       prev_rvec=None, prev_tvec=None, mirrored=False, initial_angles=None):
     model_points = MODEL_POINTS_MIRRORED if mirrored else MODEL_POINTS
     image_points = np.array(
         [[landmarks[index].x * width, landmarks[index].y * height] for index in HEAD_INDICES],
         dtype=np.float64,
     )
+    if prev_rvec is None and initial_angles is not None:
+        rotation = angles_to_rotation_matrix(initial_angles)
+        rotated = model_points @ rotation.T
+        normalized = cv2.undistortPoints(image_points.reshape(-1, 1, 2),
+                                         camera_matrix, dist_coeffs).reshape(-1, 2)
+        # For fixed rotation, perspective equations are linear in translation.
+        # Estimate translation from this frame rather than reusing old distance.
+        equations = np.zeros((len(model_points) * 2, 3))
+        equations[0::2, 0] = equations[1::2, 1] = 1
+        equations[0::2, 2] = -normalized[:, 0]
+        equations[1::2, 2] = -normalized[:, 1]
+        rhs = (normalized * rotated[:, 2:3] - rotated[:, :2]).reshape(-1)
+        translation, _, rank, _ = np.linalg.lstsq(equations, rhs, rcond=None)
+        if rank == 3 and np.isfinite(translation).all():
+            prev_rvec = cv2.Rodrigues(rotation)[0]
+            prev_tvec = translation.reshape(3, 1)
     if prev_rvec is None:
         ok, rvec, tvec = cv2.solvePnP(
             model_points, image_points, camera_matrix, dist_coeffs,
@@ -105,12 +135,39 @@ def check_winks(landmarks, width, height, threshold=0.18):
     
     return left_wink, right_wink
 
-def normalized_iris_position(landmarks, width, height) -> tuple[float, float]:
+EYE_LIDS = {
+    468: ((160, 158), (153, 144)),
+    473: ((387, 385), (380, 373)),
+}
+
+
+def eyelid_vertical_compensation(eye_y: float, d_upper: float, d_lower: float, gain: float = 0.15) -> float:
+    """Compensate downward iris center bias caused by upper eyelid occlusion.
+
+    When looking down, the upper eyelid descends and partially covers the upper
+    iris rim, biasing MediaPipe's visible-iris centroid downward. If the ratio
+    of upper-lid-to-pupil distance over lower-lid-to-pupil distance exceeds a
+    downward gaze threshold, apply a smooth non-linear correction factor.
+    """
+    if eye_y <= 0 or d_upper <= 0 or d_lower <= 0:
+        return 0.0
+    opening = d_upper + d_lower
+    if opening <= 1e-6:
+        return 0.0
+    asymmetry = (d_upper - d_lower) / opening
+    if asymmetry <= 0.2:
+        return 0.0
+    correction = gain * eye_y * ((asymmetry - 0.2) / 0.8) ** 2
+    return float(correction)
+
+
+def normalized_iris_position(landmarks, width, height, compensate_eyelids: bool = False) -> tuple[float, float]:
     """Return binocular iris displacement in eye widths, along eye-local axes.
 
     Positive x points toward image right; positive y points below the eye.
     Corner midpoints and widths remove image translation and uniform scaling.
     The local axes compensate for roll while the eyes remain roughly upright.
+    When compensate_eyelids is True, downward eyelid occlusion bias is corrected.
     """
     if len(landmarks) < 478 or not np.isfinite([width, height]).all() or min(width, height) <= 0:
         raise ValueError("A complete face mesh and valid frame dimensions are required")
@@ -136,8 +193,24 @@ def normalized_iris_position(landmarks, width, height) -> tuple[float, float]:
             horizontal = -horizontal
         vertical = np.array([-horizontal[1], horizontal[0]])
         displacement = (pupil - (start + end) / 2) / eye_width
+        disp_x = float(displacement @ horizontal)
+        disp_y = float(displacement @ vertical)
+        if compensate_eyelids and iris_index in EYE_LIDS:
+            upper_indices, lower_indices = EYE_LIDS[iris_index]
+            upper_pts = np.array(
+                [(landmarks[i].x * width, landmarks[i].y * height) for i in upper_indices]
+            )
+            lower_pts = np.array(
+                [(landmarks[i].x * width, landmarks[i].y * height) for i in lower_indices]
+            )
+            if np.isfinite(upper_pts).all() and np.isfinite(lower_pts).all():
+                upper_mid = upper_pts.mean(axis=0)
+                lower_mid = lower_pts.mean(axis=0)
+                d_upper = float(((pupil - upper_mid) / eye_width) @ vertical)
+                d_lower = float(((lower_mid - pupil) / eye_width) @ vertical)
+                disp_y -= eyelid_vertical_compensation(disp_y, d_upper, d_lower)
         # Normalize both components by width; eyelid opening varies with blinks.
-        positions.append((displacement @ horizontal, displacement @ vertical))
+        positions.append((disp_x, disp_y))
 
     result = np.mean(positions, axis=0)
     if not np.isfinite(result).all():
@@ -148,9 +221,14 @@ def normalized_iris_position(landmarks, width, height) -> tuple[float, float]:
 class VisionProcessor:
     """Publish eye-relative gaze and solvePnP head angles for each camera frame."""
 
-    def __init__(self, face_mesh=None, mirrored=True):
+    def __init__(self, face_mesh=None, mirrored=True, initial_head=None, compensate_eyelids: bool = False):
+        self.initial_angles = None
+        if initial_head is not None:
+            self.initial_angles = [initial_head[key] for key in ("pitch", "yaw", "roll")]
+            angles_to_rotation_matrix(self.initial_angles)
         self.face_mesh = face_mesh if face_mesh is not None else _create_face_mesh()
         self.mirrored = mirrored
+        self.compensate_eyelids = compensate_eyelids
         self.prev_rvec = None
         self.prev_tvec = None
         self.left_winking = False
@@ -182,7 +260,7 @@ class VisionProcessor:
             return invalid
             
         try:
-            eye_x, eye_y = normalized_iris_position(landmarks, width, height)
+            eye_x, eye_y = normalized_iris_position(landmarks, width, height, compensate_eyelids=self.compensate_eyelids)
         except ValueError:
             self.prev_rvec = self.prev_tvec = None
             return invalid
@@ -191,6 +269,7 @@ class VisionProcessor:
         pose = estimate_head_pose(
             landmarks, width, height, camera_matrix, dist_coeffs,
             self.prev_rvec, self.prev_tvec, mirrored=self.mirrored,
+            initial_angles=self.initial_angles,
         )
         if pose is None or not np.isfinite(pose[:3]).all():
             self.prev_rvec = self.prev_tvec = None
@@ -272,7 +351,11 @@ def run_preview(freeze_duration=0.5):
                 cv2.putText(frame, f"Yaw:   {yaw:6.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Roll:  {roll:6.1f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            my_mouse.winkClick(processor.left_winking, processor.right_winking)
+            if sample.tracking_valid:
+                my_mouse.winkClick(processor.left_winking, processor.right_winking,
+                                   eyes_open=sample.eyes_open, timestamp=sample.timestamp)
+            else:
+                my_mouse._pause(cancel_gestures=True)
 
             cv2.imshow("Real-Time Tracking", frame)
             key = cv2.waitKey(5) & 0xFF

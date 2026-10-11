@@ -95,73 +95,105 @@ class TestWinkDetection(unittest.TestCase):
 
 class TestMouseControllerWinkClick(unittest.TestCase):
     def setUp(self):
-        self.controller = MouseController()
+        self.now = 100.0
+        self.controller = MouseController(mouse_module=Mock(), clock=lambda: self.now)
+        self.controller._trigger_click = Mock()
 
-    @patch.object(MouseController, "_trigger_click")
-    def test_left_wink_triggers_left_click(self, mock_trigger):
-        self.controller.winkClick(left_winking=True, right_winking=False)
-        mock_trigger.assert_called_once_with("left")
-        self.assertTrue(self.controller.wink_debounce_flag)
+    def frame(self, left=False, right=False, eyes_open=False, dt=.05):
+        self.now += dt
+        self.controller.winkClick(left, right, eyes_open=eyes_open, timestamp=self.now)
 
-    @patch.object(MouseController, "_trigger_click")
-    def test_right_wink_triggers_double_left_click(self, mock_trigger):
-        self.controller.winkClick(left_winking=False, right_winking=True)
-        mock_trigger.assert_called_once_with("double_left")
-        self.assertTrue(self.controller.wink_debounce_flag)
+    def hold(self, side="left", count=5):
+        for _ in range(count):
+            self.frame(left=side == "left", right=side == "right")
 
-    @patch.object(MouseController, "_trigger_click")
-    def test_debounce_prevents_multiple_clicks_while_holding_wink(self, mock_trigger):
-        # Frame 1: Initial left wink -> click fires
-        self.controller.winkClick(left_winking=True, right_winking=False)
-        self.assertEqual(mock_trigger.call_count, 1)
+    def reopen(self):
+        for _ in range(7):
+            self.frame(eyes_open=True)
 
-        # Frame 2-5: User still winking in subsequent camera frames -> no new clicks
-        for _ in range(4):
-            self.controller.winkClick(left_winking=True, right_winking=False)
-        self.assertEqual(mock_trigger.call_count, 1, "Click should not repeat while wink is held")
+    def test_left_and_right_bindings_after_hold_and_reopening(self):
+        self.hold()
+        self.controller._trigger_click.assert_not_called()
+        self.reopen()
+        self.controller._trigger_click.assert_called_once_with("left")
+        self.hold("right")
+        self.reopen()
+        self.assertEqual(self.controller._trigger_click.call_count, 2)
+        self.controller._trigger_click.assert_called_with("double_left")
 
-    @patch.object(MouseController, "_trigger_click")
-    def test_release_both_eyes_resets_debounce(self, mock_trigger):
-        # 1. Left wink fires
-        self.controller.winkClick(left_winking=True, right_winking=False)
-        self.assertEqual(mock_trigger.call_count, 1)
+    def test_holding_wink_does_not_repeat_clicks(self):
+        self.hold(count=30)
+        self.controller._trigger_click.assert_not_called()
+        self.reopen()
+        self.reopen()
+        self.controller._trigger_click.assert_called_once_with("left")
 
-        # 2. Both eyes open (release wink)
-        self.controller.winkClick(left_winking=False, right_winking=False)
-        self.assertFalse(self.controller.wink_debounce_flag, "Debounce flag should reset when eyes reopen")
+    def test_brief_wink_or_too_few_frames_does_not_click(self):
+        self.frame(left=True)
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
+        self.frame(left=True)
+        self.frame(left=True, dt=.2)
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
 
-        # 3. Left wink fires again
-        self.controller.winkClick(left_winking=True, right_winking=False)
-        self.assertEqual(mock_trigger.call_count, 2)
-        mock_trigger.assert_called_with("left")
+    def test_bilateral_blink_cancels_even_qualified_wink(self):
+        self.hold()
+        self.frame()
+        self.hold()
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
+        self.hold()
+        self.reopen()
+        self.controller._trigger_click.assert_called_once_with("left")
 
-    @patch.object(MouseController, "_trigger_click")
-    def test_alternating_winks_with_release(self, mock_trigger):
-        # Left wink
-        self.controller.winkClick(left_winking=True, right_winking=False)
-        self.assertEqual(mock_trigger.call_count, 1)
-        self.assertEqual(mock_trigger.call_args[0][0], "left")
+    def test_short_reopening_or_switching_eyes_cancels_gesture(self):
+        self.hold()
+        self.frame(eyes_open=True)
+        self.hold()
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
+        self.hold()
+        self.hold("right")
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
 
-        # Open eyes
-        self.controller.winkClick(left_winking=False, right_winking=False)
+    def test_head_and_wink_share_cooldown(self):
+        self.controller.cooldown = 2
+        self.controller.headClick(-18, timestamp=self.now)
+        self.now += .2
+        self.controller.headClick(-18, timestamp=self.now)
+        self.controller._trigger_click.assert_called_once_with("left")
+        self.hold("right")
+        self.reopen()
+        self.controller._trigger_click.assert_called_once()
+        self.now += 2
+        self.hold("right")
+        self.reopen()
+        self.controller._trigger_click.assert_called_with("double_left")
 
-        # Right wink (double left click)
-        self.controller.winkClick(left_winking=False, right_winking=True)
-        self.assertEqual(mock_trigger.call_count, 2)
-        self.assertEqual(mock_trigger.call_args[0][0], "double_left")
-
-    @patch.object(MouseController, "_trigger_click")
-    def test_neither_winking_does_not_fire_click(self, mock_trigger):
-        self.controller.winkClick(left_winking=False, right_winking=False)
-        mock_trigger.assert_not_called()
-        self.assertFalse(self.controller.wink_debounce_flag)
+    def test_profile_hold_frame_count_and_settle_are_honored(self):
+        self.controller.hold_seconds = .3
+        self.controller.closed_eye_frames = 8
+        self.controller.settle_seconds = .4
+        self.hold(count=5)
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
+        # Complete reopening before starting a second attempt.
+        self.reopen()
+        self.hold(count=9)
+        self.reopen()
+        self.controller._trigger_click.assert_not_called()
+        self.reopen()
+        self.controller._trigger_click.assert_called_once_with("left")
 
     @patch("core.mouse_controller.ctypes.windll.user32.mouse_event")
     @patch("core.mouse_controller.mouse.press", side_effect=Exception("Simulated mouse library failure"))
     @patch("core.mouse_controller.mouse.double_click", side_effect=Exception("Simulated mouse library failure"))
     def test_windows_events_double_left_click_fallback(self, mock_double_click, mock_press, mock_mouse_event):
+        self.controller.mouse = __import__("mouse")
         # Trigger double_left click in fallback mode
-        self.controller._trigger_click("double_left")
+        MouseController._trigger_click(self.controller, "double_left")
 
         # Must execute: LEFTDOWN (0x0002), LEFTUP (0x0004), LEFTDOWN (0x0002), LEFTUP (0x0004)
         expected_calls = [
@@ -174,53 +206,30 @@ class TestMouseControllerWinkClick(unittest.TestCase):
 
 
 class TestWinkClickingIntegration(unittest.TestCase):
-    def setUp(self):
-        self.controller = MouseController()
-        self.width = 640
-        self.height = 480
-
-    @patch.object(MouseController, "_trigger_click")
-    def test_full_pipeline_blink_vs_wink(self, mock_trigger):
-        # 1. Normal frame: both eyes open
-        landmarks_open = create_mock_eye_landmarks(left_open=True, right_open=True)
-        lw, rw = check_winks(landmarks_open, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-        mock_trigger.assert_not_called()
-
-        # 2. Blink: both eyes closed
-        landmarks_blink = create_mock_eye_landmarks(left_open=False, right_open=False)
-        lw, rw = check_winks(landmarks_blink, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-        mock_trigger.assert_not_called()  # Blinking must not trigger clicks
-
-        # 3. Eyes reopen
-        lw, rw = check_winks(landmarks_open, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-        mock_trigger.assert_not_called()
-
-        # 4. Intentional Left Wink (left closed, right open)
-        landmarks_left_wink = create_mock_eye_landmarks(left_open=False, right_open=True)
-        lw, rw = check_winks(landmarks_left_wink, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-        mock_trigger.assert_called_once_with("left")
-
-        # 5. Holding left wink over 3 frames (debounce must prevent re-firing)
-        for _ in range(3):
-            self.controller.winkClick(lw, rw)
-        self.assertEqual(mock_trigger.call_count, 1)
-
-        # 6. Reopen eyes
-        lw, rw = check_winks(landmarks_open, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-
-        # 7. Intentional Right Wink (right closed, left open) -> Double left click
-        landmarks_right_wink = create_mock_eye_landmarks(left_open=True, right_open=False)
-        lw, rw = check_winks(landmarks_right_wink, self.width, self.height)
-        self.controller.winkClick(lw, rw)
-        self.assertEqual(mock_trigger.call_count, 2)
-        self.assertEqual(mock_trigger.call_args[0][0], "double_left")
+    def test_landmarks_distinguish_blink_reopening_from_deliberate_wink(self):
+        now = 100.0
+        controller = MouseController(mouse_module=Mock(), clock=lambda: now)
+        controller._trigger_click = Mock()
+        def frames(left_open, right_open, count):
+            nonlocal now
+            landmarks = create_mock_eye_landmarks(left_open, right_open)
+            for _ in range(count):
+                now += .05
+                left, right = check_winks(landmarks, 640, 480)
+                controller.winkClick(left, right, eyes_open=left_open and right_open, timestamp=now)
+        frames(True, True, 7)
+        frames(False, True, 1)
+        frames(False, False, 2)
+        frames(False, True, 1)
+        frames(True, True, 7)
+        controller._trigger_click.assert_not_called()
+        frames(False, True, 5)
+        frames(True, True, 7)
+        controller._trigger_click.assert_called_once_with("left")
+        frames(True, False, 5)
+        frames(True, True, 7)
+        controller._trigger_click.assert_called_with("double_left")
 
 
 if __name__ == "__main__":
     unittest.main()
-

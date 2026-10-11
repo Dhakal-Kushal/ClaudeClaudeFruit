@@ -13,7 +13,7 @@ from core.calibration import (CalibrationSample, EYE_TARGETS, TrackingAdapter,
                               camera_compatibility_errors, load_profile,
                               profile_compatibility_errors, save_profile)
 from core.math_filters import PiecewiseAffineMapping2D
-from core.validation import ValidationSession, validation_targets
+from core.validation import ValidationSession, validation_targets, quality_warnings
 from core.vision_pipeline import VisionPipeline
 from test_calibration import CAMERA, MONITOR, completed_session, validated_profile
 from ui.calibration_window import CalibrationWindow
@@ -35,6 +35,53 @@ def finish_validation(session, offset=(0, 0)):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_quality_limits_and_each_failure_reason(self):
+        profile = validated_profile()
+        diagonal = np.hypot(MONITOR["width"], MONITOR["height"])
+        report = profile["validation"]
+        self.assertEqual(quality_warnings(report, MONITOR), [])
+        for key, limit in (("median_error_px", .025), ("p90_error_px", .05)):
+            altered = copy.deepcopy(report)
+            altered[key] = diagonal * limit
+            self.assertEqual(quality_warnings(altered, MONITOR), [])
+            altered[key] += 1
+            self.assertTrue(quality_warnings(altered, MONITOR))
+        for key, value in (("bias_px", [diagonal * .031, 0]),
+                           ("rms_jitter_px", diagonal * .021)):
+            altered = copy.deepcopy(report)
+            altered["targets"][0][key] = value
+            self.assertTrue(quality_warnings(altered, MONITOR))
+
+    def test_high_error_report_can_be_explicitly_accepted_saved_loaded_and_started(self):
+        profile = completed_session().build_profile(camera=CAMERA)
+        session = ValidationSession(profile)
+        finish_validation(session, (180, 100))
+        profile["validation"] = session.build_report()
+        self.assertTrue(quality_warnings(profile["validation"], MONITOR))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            path.write_text("original")
+            with self.assertRaises(ValueError):
+                save_profile(path, profile)
+            self.assertEqual(path.read_text(), "original")
+            profile["validation"]["accepted"] = True
+            original = copy.deepcopy(profile)
+            save_profile(path, profile)
+            self.assertEqual(load_profile(path), original)
+            self.assertEqual(app.check_profile(path, MONITOR), original)
+            self.assertEqual(profile_compatibility_errors(original, MONITOR, CAMERA), [])
+        with patch.object(app, "get_current_monitor", return_value=MONITOR), \
+             patch.object(app, "VisionPipeline") as pipeline_factory, \
+             patch.object(app, "MouseController") as controller:
+            pipeline = pipeline_factory.return_value
+            pipeline.camera_ready.wait.return_value = True
+            pipeline.get_camera_metadata.return_value = CAMERA
+            pipeline.stop_event.is_set.side_effect = [False, True]
+            pipeline.errors.empty.return_value = True
+            app.run_tracking(0, profile)
+            controller.return_value.start.assert_called_once()
+            controller.return_value.stop.assert_called_once()
+
     def test_independent_targets_respect_monitor_origin(self):
         profile = completed_session().build_profile()
         monitor = {**MONITOR, "x": -1920, "y": 120}
@@ -225,6 +272,37 @@ class CalibrationUITests(unittest.TestCase):
         window._accept_calibration()
         self.assertTrue(window._closed)
         self.assertTrue(load_profile(self.path)["validation"]["accepted"])
+
+    def test_high_error_results_offer_use_anyway_and_save_measured_errors(self):
+        window = self.window
+        window.threshold.set("18\u00b0")
+        window.session = completed_session()
+        window._finish_calibration()
+        self.assertEqual(window.candidate_profile["gesture_settings"]["trigger_degrees"], 18)
+        finish_validation(window.session, (180, 100))
+        window._finish_validation()
+        self.assertEqual(window.start_button.cget("state"), "normal")
+        self.assertEqual(window.start_button.cget("text"), "Use anyway")
+        self.assertIn("suggested targets", window.message.cget("text"))
+        self.assertIn("Retry calibration", window.message.cget("text"))
+        self.assertEqual(self.path.read_text(), "original")
+        measured = copy.deepcopy(window.candidate_profile["validation"])
+        window._accept_calibration()
+        saved = load_profile(self.path)
+        measured["accepted"] = True
+        self.assertEqual(saved["validation"], measured)
+        self.assertTrue(window._closed)
+
+    def test_high_error_results_can_be_retried_without_saving(self):
+        window = self.window
+        window.session = completed_session()
+        window._finish_calibration()
+        finish_validation(window.session, (180, 100))
+        window._finish_validation()
+        window.start_calibration()
+        self.assertEqual(window.phase, "calibration")
+        self.assertEqual(window.threshold.cget("state"), "normal")
+        self.assertEqual(self.path.read_text(), "original")
 
     def test_queued_frames_from_previous_target_do_not_start_next_capture(self):
         from time import monotonic

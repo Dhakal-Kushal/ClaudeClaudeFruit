@@ -101,8 +101,63 @@ class PiecewiseAffineMapping2DTests(unittest.TestCase):
         target[:] = 0
         np.testing.assert_allclose(mapping.map_coordinates(*SOURCE_POINTS[0]), TARGET_POINTS[0], atol=1e-9)
 
+    def test_blend_width_validation(self):
+        # Valid values
+        for valid in (0.0, 0.01, 0.05, 0.49):
+            m = PiecewiseAffineMapping2D(SOURCE_POINTS, TARGET_POINTS, blend_width=valid)
+            self.assertEqual(m._blend_width, valid)
+
+        # Invalid values
+        for invalid in (-0.01, 0.5, 1.0, np.nan, np.inf, True, False, "0.05"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                PiecewiseAffineMapping2D(SOURCE_POINTS, TARGET_POINTS, blend_width=invalid)
+
+    def test_sector_boundary_derivative_continuity(self):
+        center = SOURCE_POINTS[4]
+        unblended = PiecewiseAffineMapping2D(SOURCE_POINTS, TARGET_POINTS, blend_width=0.0)
+        blended = PiecewiseAffineMapping2D(SOURCE_POINTS, TARGET_POINTS, blend_width=0.04)
+
+        for corner_idx in range(4):
+            corner = SOURCE_POINTS[corner_idx]
+            ray_dir = corner - center
+            ray_perp = np.array([-ray_dir[1], ray_dir[0]])
+            ray_perp = ray_perp / np.linalg.norm(ray_perp)
+
+            test_point_on_ray = center + 0.6 * ray_dir
+            s_vals = np.linspace(-0.015, 0.015, 601)
+
+            pts_unblended = np.array([unblended.map_coordinates(*(test_point_on_ray + s * ray_perp)) for s in s_vals])
+            pts_blended = np.array([blended.map_coordinates(*(test_point_on_ray + s * ray_perp)) for s in s_vals])
+
+            ds = s_vals[1] - s_vals[0]
+            d_unblended = np.diff(pts_unblended, axis=0) / ds
+            d_blended = np.diff(pts_blended, axis=0) / ds
+
+            step_unblended = np.max(np.abs(np.diff(d_unblended, axis=0)))
+            step_blended = np.max(np.abs(np.diff(d_blended, axis=0)))
+
+            # Unblended exhibits a severe derivative jump across the sector ray
+            self.assertGreater(step_unblended, 20.0)
+            # Blended eliminates the derivative step, transitioning smoothly
+            self.assertLess(step_blended, 1.0)
+
+
 
 class KalmanFilter2DTests(unittest.TestCase):
+    def test_step_changes_do_not_overshoot_at_multiple_frame_rates(self):
+        for fps in (15, 20, 30, 60):
+            tracker = KalmanFilter2D()
+            for _ in range(120):
+                tracker.update(500, 500, dt=1/fps)
+            for target in ((1500, 900), (300, 200), (1800, 700)):
+                previous = tracker._last_output.copy()
+                for _ in range(fps * 2):
+                    result = np.array(tracker.update(*target, dt=1/fps))
+                    self.assertTrue((result >= np.minimum(previous, target)-1e-9).all())
+                    self.assertTrue((result <= np.maximum(previous, target)+1e-9).all())
+                    previous = result
+                np.testing.assert_allclose(result, target, atol=2)
+
     def test_mapped_measurements_preserve_symmetric_positive_covariance_with_variable_dt(self):
         mapping = PiecewiseAffineMapping2D(SOURCE_POINTS, TARGET_POINTS)
         tracker = KalmanFilter2D()
@@ -193,6 +248,35 @@ class KalmanFilter2DTests(unittest.TestCase):
         np.testing.assert_allclose(
             tracker.update(110.0, 205.0), reference.update(110.0, 205.0)
         )
+
+    def test_internal_state_divergence_is_bounded_during_overshoot(self):
+        tracker = KalmanFilter2D()
+        for _ in range(60):
+            tracker.update(500.0, 500.0)
+        rng = np.random.default_rng(42)
+        measurements = 600.0 + rng.normal(0, 5, size=(60, 2))
+        max_dev = 2.0 * np.sqrt(tracker._measurement_noise)
+        for m in measurements:
+            out = tracker.update(*m)
+            divergence = np.linalg.norm(tracker._state[:2] - out)
+            self.assertLessEqual(divergence, max_dev * np.sqrt(2) + 1e-6)
+
+    def test_stationary_fixation_jitter_reduction(self):
+        tracker = KalmanFilter2D(measurement_noise=25.0)
+        rng = np.random.default_rng(123)
+        target = np.array([960.0, 540.0])
+        # Settle filter
+        for _ in range(30):
+            tracker.update(*target)
+        # 100 noisy samples around stationary fixation
+        noise = rng.normal(0, 4.0, size=(100, 2))
+        raw_samples = target + noise
+        filtered = np.array([tracker.update(*sample) for sample in raw_samples])
+        raw_rms = np.sqrt(np.mean(np.sum((raw_samples - target)**2, axis=1)))
+        filtered_rms = np.sqrt(np.mean(np.sum((filtered - target)**2, axis=1)))
+        # Filter should damp stationary measurement noise by at least 30%
+        self.assertLess(filtered_rms, raw_rms * 0.70)
+
 
 
 if __name__ == "__main__":

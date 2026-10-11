@@ -78,8 +78,10 @@ class CalibrationSample:
 class TrackingAdapter:
     """A separate calibration queue, safe to publish to from a tracking thread."""
 
-    def __init__(self):
-        self.samples = Queue(maxsize=180)
+    def __init__(self, max_samples=180):
+        if not isinstance(max_samples, int) or max_samples < 1:
+            raise ValueError("max_samples must be a positive integer")
+        self.samples = Queue(maxsize=max_samples)
         self._lock = Lock()
 
     def publish(self, eye_x, eye_y, pitch, yaw, roll, **kwargs):
@@ -102,21 +104,52 @@ def angle_delta(angles, baseline):
     return (np.asarray(angles) - np.asarray(baseline) + 180.0) % 360.0 - 180.0
 
 
-def screen_targets(monitor, inset=24):
+def compensate_head_pose(eye_x, eye_y, pitch, yaw, neutral_head, yaw_gain=0.007, pitch_gain=0.007):
+    """Compensate eye-relative gaze coordinates for head yaw and pitch rotation.
+
+    When the head turns away from neutral posture, the eyes rotate in the opposite
+    direction in their sockets to maintain gaze fixation (Vestibulo-Ocular Reflex).
+    This first-order compensation adds the head-rotation displacement back into the
+    eye coordinates so gaze tracking remains stable during natural head micro-movements.
+    """
+    if isinstance(neutral_head, dict):
+        neutral_p = neutral_head.get("pitch", 0.0)
+        neutral_y = neutral_head.get("yaw", 0.0)
+    else:
+        neutral_p = neutral_head[0]
+        neutral_y = neutral_head[1]
+    deltas = angle_delta([pitch, yaw], [neutral_p, neutral_y])
+    comp_x = eye_x + yaw_gain * deltas[1]
+    comp_y = eye_y + pitch_gain * deltas[0]
+    return float(comp_x), float(comp_y)
+
+
+def screen_targets(monitor, inset=None):
+    """Compute calibration targets, inset by default ~8% to reduce corner eye strain."""
     width, height = monitor["width"], monitor["height"]
     left, top = monitor.get("x", 0), monitor.get("y", 0)
+    if inset is None:
+        inset_x = int(round(width * 0.08))
+        inset_y = int(round(height * 0.08))
+    elif isinstance(inset, (tuple, list)):
+        inset_x, inset_y = int(inset[0]), int(inset[1])
+    elif isinstance(inset, float) and 0.0 < inset < 0.5:
+        inset_x = int(round(width * inset))
+        inset_y = int(round(height * inset))
+    else:
+        inset_x = inset_y = int(inset)
     return {
-        "top_left": [left + inset, top + inset],
-        "top_right": [left + width - 1 - inset, top + inset],
-        "bottom_right": [left + width - 1 - inset, top + height - 1 - inset],
-        "bottom_left": [left + inset, top + height - 1 - inset],
+        "top_left": [left + inset_x, top + inset_y],
+        "top_right": [left + width - 1 - inset_x, top + inset_y],
+        "bottom_right": [left + width - 1 - inset_x, top + height - 1 - inset_y],
+        "bottom_left": [left + inset_x, top + height - 1 - inset_y],
         "center": [left + (width - 1) / 2, top + (height - 1) / 2],
     }
 
 
-def screen_targets_in_canvas(monitor, canvas_width, canvas_height):
+def screen_targets_in_canvas(monitor, canvas_width, canvas_height, inset=None):
     """Map monitor-coordinate targets into the calibration canvas dimensions."""
-    targets = screen_targets(monitor)
+    targets = screen_targets(monitor, inset=inset)
     left, top = monitor.get("x", 0), monitor.get("y", 0)
     return {
         name: [
@@ -132,11 +165,11 @@ def validate_eye_targets(targets):
 
 
 class CalibrationSession:
-    def __init__(self, monitor, countdown=2.0, capture_seconds=1.5, min_samples=15, screen_positions=None):
+    def __init__(self, monitor, countdown=2.0, capture_seconds=1.5, min_samples=15, screen_positions=None, inset=None):
         if countdown < 0 or capture_seconds <= 0 or min_samples < 2:
             raise ValueError("Invalid calibration timing")
         self.monitor = dict(monitor)
-        self.screen_positions = screen_positions if screen_positions is not None else screen_targets(monitor)
+        self.screen_positions = screen_positions if screen_positions is not None else screen_targets(monitor, inset=inset)
         self.countdown = countdown
         self.capture_seconds = capture_seconds
         self.min_samples = min_samples
@@ -236,6 +269,11 @@ class CalibrationSession:
                 "bindings": {},
             },
             "smoothing": {"method": "kalman", "process_noise": 10000.0, "measurement_noise": 25.0},
+            "head_pose_compensation": {
+                "enabled": True,
+                "yaw_gain": 0.007,
+                "pitch_gain": 0.007,
+            },
         }
         validate_profile(profile)
         return profile
@@ -274,6 +312,9 @@ def validate_profile(profile, monitor=None, *, require_validation=False):
             raise ValueError("Gesture settings must be finite and positive")
     if gestures["release_degrees"] >= gestures["trigger_degrees"] or not isinstance(gestures["bindings"], dict):
         raise ValueError("Gesture settings are inconsistent")
+    if (gestures["trigger_degrees"] >= gestures["max_roll_degrees"]
+            or type(gestures["closed_eye_frames"]) is not int):
+        raise ValueError("Invalid tilt range or closed-eye frame count")
     smoothing = profile["smoothing"]
     if smoothing["method"] not in ("kalman", "moving_average"):
         raise ValueError("Smoothing settings are missing")
@@ -284,6 +325,17 @@ def validate_profile(profile, monitor=None, *, require_validation=False):
     elif (not isinstance(smoothing.get("window_size"), int)
           or isinstance(smoothing.get("window_size"), bool) or smoothing["window_size"] < 1):
         raise ValueError("Invalid moving-average window size")
+    pose_comp = profile.get("head_pose_compensation")
+    if pose_comp is not None:
+        if not isinstance(pose_comp, dict):
+            raise ValueError("Invalid head-pose compensation settings")
+        if "enabled" in pose_comp and type(pose_comp["enabled"]) is not bool:
+            raise ValueError("Invalid head-pose compensation enabled flag")
+        for key in ("yaw_gain", "pitch_gain"):
+            if key in pose_comp:
+                val = pose_comp[key]
+                if not isinstance(val, (int, float)) or isinstance(val, bool) or not np.isfinite(val) or val < 0:
+                    raise ValueError(f"Invalid head-pose compensation {key}")
     if require_validation:
         validate_camera_metadata(profile["camera"])
         # Local import avoids a cycle: validation uses the gaze mapper.
