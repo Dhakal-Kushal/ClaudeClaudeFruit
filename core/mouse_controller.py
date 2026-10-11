@@ -349,7 +349,6 @@ class MouseController:
                 self._cancel_wink(blocked=True)
             return
 
-        self.headClick(roll, timestamp=sample.timestamp)
         if abs(roll) > self.max_head_deviation:
             self._pause()
             self._cancel_wink(blocked=True)
@@ -409,26 +408,9 @@ class MouseController:
         self.last_click_time = now
         self._pause()
 
-    def headClick(self, d_roll, timestamp=None):
-        timestamp = self.clock() if timestamp is None else timestamp
-        if abs(d_roll) > self.max_roll_degrees:
-            self.debounce_flag = True
-            self._tilt_candidate = self._tilt_since = None
-            return
-        if abs(d_roll) < self.reset_threshold:
-            self.debounce_flag = False
-            self._tilt_candidate = self._tilt_since = None
-            return
-        if self.debounce_flag:
-            return
-        direction = 1 if d_roll > self.tilt_threshold else -1 if d_roll < -self.tilt_threshold else None
-        if direction is None:
-            self._tilt_candidate = self._tilt_since = None
-        elif direction != self._tilt_candidate:
-            self._tilt_candidate, self._tilt_since = direction, timestamp
-        elif timestamp - self._tilt_since >= self.hold_seconds:
-            self._click_if_ready("double_left" if direction == 1 else "left")
-            self.debounce_flag = True
+    def headClick(self, d_roll=0.0, timestamp=None):
+        """No-op: Head movement clicking has been disabled in favor of wink clicking."""
+        pass
 
     def winkClick(self, left_winking=False, right_winking=False, is_blinking=False, *, eyes_open=None, timestamp=None):
         """Handle wink clicking, supporting both immediate mode and hold-and-reopen mode.

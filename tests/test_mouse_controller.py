@@ -367,31 +367,24 @@ class MouseControllerTests(unittest.TestCase):
         self.feed(pitch=160)
         self.mock_mouse.move.assert_not_called()
 
-    def test_tilt_requires_hold_and_freezes_before_click(self):
+    def test_head_tilt_never_triggers_clicks(self):
         self.feed()
         self.mock_mouse.reset_mock()
-        self.feed(400, 100, roll=-18)
-        self.mock_mouse.click.assert_not_called()
-        self.mock_mouse.move.assert_not_called()
-        for _ in range(5):
+        # Feed extreme and held head tilt (roll=-18, roll=+18, roll=30)
+        for _ in range(10):
             self.feed(400, 100, roll=-18)
-        self.mock_mouse.click.assert_called_once_with("left")
-        self.mock_mouse.move.assert_not_called()
-        for _ in range(6):
-            self.feed(roll=-18)
-        self.mock_mouse.click.assert_called_once()
-        self.recover()
-        self.mock_mouse.move.assert_called_with(960, 540, absolute=True)
-
-    def test_extreme_tilt_requires_neutral_before_next_click(self):
-        self.feed(roll=30)
-        for _ in range(6):
-            self.feed(roll=18)
+        self.mock_mouse.click.assert_not_called()
         self.mock_mouse.double_click.assert_not_called()
-        self.feed()
+
+        for _ in range(10):
+            self.feed(400, 100, roll=18)
+        self.mock_mouse.click.assert_not_called()
+        self.mock_mouse.double_click.assert_not_called()
+
         for _ in range(6):
-            self.feed(roll=18)
-        self.mock_mouse.double_click.assert_called_once_with("left")
+            self.feed(roll=30)
+        self.mock_mouse.click.assert_not_called()
+        self.mock_mouse.double_click.assert_not_called()
 
     def test_left_and_right_wink_click_after_reopening(self):
         self.feed()

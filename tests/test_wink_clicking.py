@@ -166,19 +166,24 @@ class TestMouseControllerWinkClick(unittest.TestCase):
         self.reopen()
         self.controller._trigger_click.assert_not_called()
 
-    def test_head_and_wink_share_cooldown(self):
+    def test_wink_clicks_share_cooldown(self):
         self.controller.cooldown = 2
-        self.controller.headClick(-18, timestamp=self.now)
-        self.now += .2
-        self.controller.headClick(-18, timestamp=self.now)
+        self.hold("left")
+        self.reopen()
         self.controller._trigger_click.assert_called_once_with("left")
         self.hold("right")
         self.reopen()
-        self.controller._trigger_click.assert_called_once()
+        self.assertEqual(self.controller._trigger_click.call_count, 1)
         self.now += 2
         self.hold("right")
         self.reopen()
+        self.assertEqual(self.controller._trigger_click.call_count, 2)
         self.controller._trigger_click.assert_called_with("double_left")
+
+    def test_head_click_is_disabled_and_does_not_click(self):
+        self.controller.headClick(-18, timestamp=self.now)
+        self.controller.headClick(18, timestamp=self.now)
+        self.controller._trigger_click.assert_not_called()
 
     def test_profile_hold_frame_count_and_settle_are_honored(self):
         self.controller.hold_seconds = .3
