@@ -87,17 +87,21 @@ class CalibrationWindow(ctk.CTk):
         self.last_sample = None
         self._closed = False
         self.cancelled = False
+        self._auto_start = auto_start
         self._poll_id = None
         self._start_id = None
         self._fullscreen_id = None
-        self._maximize_id = self.after(0, self._maximize_window)
+        self._maximize_id = None
         self.protocol("WM_DELETE_WINDOW", self._cancel_and_close)
         self.bind("<Escape>", lambda event: self.cancel_calibration())
         self._build_dashboard()
         self._refresh_dashboard()
         self._poll_id = self.after(40, self._poll_tracking)
-        if auto_start and self.profile is None:
-            self._start_id = self.after(350, self.start_calibration)
+        if auto_start:
+            self.withdraw()
+            self._start_id = self.after(0, self.start_calibration)
+        else:
+            self._maximize_id = self.after(0, self._maximize_window)
 
     def _maximize_window(self):
         self._maximize_id = None
@@ -176,7 +180,7 @@ class CalibrationWindow(ctk.CTk):
         self.session = CalibrationSession(self.monitor)
         self.stage = tk.Toplevel(self, bg=BACKGROUND)
         self.stage.withdraw()
-        self.stage.protocol("WM_DELETE_WINDOW", self.close)
+        self.stage.protocol("WM_DELETE_WINDOW", self._cancel_and_close)
         self.stage.bind("<Escape>", lambda event: self.cancel_calibration())
         self.canvas = tk.Canvas(self.stage, bg=BACKGROUND, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -318,8 +322,9 @@ class CalibrationWindow(ctk.CTk):
             self._fullscreen_id = None
         if self.stage is not None:
             self.stage.destroy()
-            self.deiconify()
-            self.state("zoomed")
+            if not getattr(self, "_auto_start", False):
+                self.deiconify()
+                self.state("zoomed")
         self.stage = None
         self.session = None
         self.start_button.configure(state="normal")
@@ -327,9 +332,15 @@ class CalibrationWindow(ctk.CTk):
         self.focus_force()
 
     def cancel_calibration(self):
-        if self.stage is not None:
-            self._close_stage()
-            self.message.configure(text="Calibration cancelled. You can start again when ready.", text_color=MUTED)
+        self.cancelled = True
+        if getattr(self, "_auto_start", False):
+            self.close()
+        else:
+            if self.stage is not None:
+                self._close_stage()
+                self.message.configure(text="Calibration cancelled. You can start again when ready.", text_color=MUTED)
+            else:
+                self.close()
 
     def close(self):
         self._closed = True

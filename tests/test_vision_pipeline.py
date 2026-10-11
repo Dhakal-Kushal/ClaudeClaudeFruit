@@ -213,6 +213,19 @@ class VisionPipelineTests(unittest.TestCase):
             window_factory.assert_not_called()
             pipeline_factory.assert_not_called()
 
+    def test_main_uses_camera_selected_in_prompt(self):
+        sample_profile = {"dummy": True}
+        with patch.object(app, "check_profile", return_value=sample_profile), \
+             patch.object(app, "prompt_startup_choice", return_value=("track", 3)), \
+             patch.object(app, "CalibrationWindow") as window_factory, \
+             patch.object(app, "VisionPipeline") as pipeline_factory, \
+             patch.object(app, "MouseController") as controller_factory, \
+             patch.object(app.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            pipeline = pipeline_factory.return_value
+            pipeline.stop_event.is_set.side_effect = [False, False, True]
+            app.main(camera_index=0)
+            self.assertEqual(pipeline_factory.call_args.kwargs["camera_index"], 3)
+
     def test_main_forces_calibration_when_calibrate_flag_passed(self):
         with patch.object(app, "check_profile", return_value=None), \
              patch.object(app, "CalibrationWindow") as window_factory, \

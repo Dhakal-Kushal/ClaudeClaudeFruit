@@ -92,7 +92,16 @@ def main(camera_index=0, calibrate=False, profile_path="calibration_profile.json
         return
 
     prompt = prompt_fn if prompt_fn is not None else prompt_startup_choice
-    choice = prompt(profile)
+    try:
+        result = prompt(profile, default_camera=camera_index, return_camera=True)
+    except TypeError:
+        result = prompt(profile)
+
+    if isinstance(result, tuple):
+        choice, camera_index = result
+    else:
+        choice = result
+
     if choice == "track":
         run_tracking(camera_index, profile)
     elif choice == "calibrate":
@@ -108,7 +117,21 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
     parser.add_argument("--calibrate", action="store_true", help="Force recalibration")
     parser.add_argument("--profile", type=str, default="calibration_profile.json", help="Path to profile JSON")
+    parser.add_argument("--list-cameras", action="store_true", help="List available webcams and exit")
     args = parser.parse_args()
+
+    if args.list_cameras:
+        from core.camera import list_available_cameras
+        print("Scanning for available webcams...")
+        cameras = list_available_cameras()
+        if not cameras:
+            print("No webcams detected.")
+        else:
+            print(f"Detected {len(cameras)} webcam(s):")
+            for c in cameras:
+                print(f"  [{c['index']}] {c['name']} ({c['width']}x{c['height']})")
+        sys.exit(0)
+
     if args.camera < 0:
         parser.error("--camera must be zero or greater")
     main(camera_index=args.camera, calibrate=args.calibrate, profile_path=args.profile)
