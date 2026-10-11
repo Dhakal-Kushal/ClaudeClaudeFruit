@@ -5,22 +5,10 @@ import time
 
 from core.calibration import (EYE_RELATIVE_COORDINATE_SPACE, TrackingAdapter, load_profile,
                               validate_profile, profile_compatibility_errors)
-from core.mouse_controller import MouseController
+from core.mouse_controller import MouseController, init_dpi_awareness
 from core.vision_pipeline import VisionPipeline
 from ui.calibration_window import CalibrationWindow, _physical_screen_size
 from ui.startup_dialog import prompt_startup_choice
-
-
-def init_dpi_awareness():
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            except (AttributeError, OSError):
-                pass
-        except (AttributeError, OSError):
-            pass
 
 def check_profile(profile_path, monitor=None):
     path = Path(profile_path)
@@ -61,11 +49,11 @@ def run_tracking(camera_index, profile, freeze_duration=0.5):
     if profile.get("mapping", {}).get("coordinate_space") != EYE_RELATIVE_COORDINATE_SPACE:
         raise ValueError("This tracker requires a new eye-relative calibration")
     validate_profile(profile, get_current_monitor(), require_validation=True)
-    adapter = TrackingAdapter()
+    adapter = TrackingAdapter(max_samples=2)
     settings = {key: profile["camera"][key] for key in ("width", "height", "fps", "flip", "backend", "fourcc")}
     pipeline = VisionPipeline(adapter, camera_index=camera_index, freeze_duration=freeze_duration,
                               capture_settings=settings,
-                              expected_camera=profile["camera"])
+                              expected_camera=profile["camera"], initial_head=profile["neutral_head"])
     controller = None
     try:
         pipeline.start()
@@ -78,7 +66,7 @@ def run_tracking(camera_index, profile, freeze_duration=0.5):
             raise ValueError("Camera compatibility check failed; recalibrate. " + "; ".join(errors))
         controller = MouseController(adapter.samples, profile, freeze_duration=freeze_duration)
         controller.start()
-        print("Live tracking active. Press Ctrl+C to stop.")
+        print("Live tracking active. Press Ctrl+C to stop. Persistent cursor pauses will report their reason.")
         while not pipeline.stop_event.is_set():
             time.sleep(0.1)
     except KeyboardInterrupt:

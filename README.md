@@ -39,17 +39,24 @@ Validation does not refit the mapping. The results screen reports median and
 90th-percentile cursor error in pixels and percent of screen diagonal, per-target
 signed X/Y bias and RMS jitter, and the fraction of frames rejected for invalid
 tracking, blinks, stale/duplicate timestamps or unstable head pose. Measurements
-use the continuous mapping with display clamping, before Kalman smoothing.
+use the continuous mapping with display clamping, before cursor smoothing.
 
 Review the results and select **Use this calibration** to atomically replace
 `calibration_profile.json`, **Retry calibration** to repeat the full process, or
-**Cancel** to preserve the previous file. There is no arbitrary accuracy pass
-threshold: complete measurements are required, and you decide whether the error
-is acceptable for your intended targets. Smaller errors are better. These are
-stationary-head measurements, not a guarantee of accuracy during head movement.
+**Cancel** to preserve the previous file. Suggested accuracy targets are median
+error <= 2.5% and p90 error <= 5% of the screen diagonal, with per-target bias
+<= 3% and RMS jitter <= 2%. These are advisory targets: webcam measurements
+may exceed them even after careful calibration. The results screen shows the
+measured errors and offers **Use anyway** or **Retry calibration** when accuracy
+is below these targets. A complete calibration can be explicitly accepted, saved,
+and reused with its original measurements. Small controls may remain difficult
+to select. Incomplete validation, nonfinite data, invalid mapping geometry, and
+camera/display incompatibility still block use. Validation never refits the map
+or changes measured errors. Previously accepted profiles remain usable regardless
+of these advisory accuracy targets.
 The profile contains the
 primary monitor resolution, actual screen target positions, eye-relative coordinates,
-neutral pitch/yaw/roll, mapping metadata, gesture settings, and Kalman settings.
+neutral pitch/yaw/roll, mapping metadata, gesture settings, and smoothing settings.
 Schema 2 also stores the validation report and the actual camera index, backend,
 frame width/height, mirroring, nominal FPS and FOURCC pixel format. Tracking
 requests the saved capture settings, reads back the negotiated values after a
@@ -95,12 +102,52 @@ New profiles record `mapping.method="piecewise_affine_v1"`. Stage 1 and Stage 2
 profiles lack the required capture metadata and accepted independent validation;
 they require a fresh calibration. Loading never rewrites the existing file.
 
-Live cursor movement uses the variable-time `KalmanFilter2D`. Its constant
-velocity model smooths frame-to-frame noise while predicting cursor movement;
-the Joseph covariance update and explicit symmetrization remain in use. A
-five-coordinate rolling average is still implemented as `CoordinateAverager2D`
-for future comparison, but the mouse controller does not call it. Final cursor
-bounds remain enforced after Kalman smoothing.
+Live cursor movement honors `smoothing.method`: `kalman` uses process and
+measurement noise parameters, while `moving_average` uses `window_size`.
+New calibrations default to Kalman. The Kalman output stays between the previous
+output and the current measurement on each axis to prevent predictive overshoot.
+Its internal motion estimate, Joseph covariance update and symmetry enforcement
+are retained. Final display bounds apply to both filters.
+
+Live movement rejects samples older than 250 ms, more than 50 ms in the future,
+or with duplicate/backward timestamps. A two-sample live queue and backlog
+draining avoid replaying old movements; skipped samples cancel pending gestures.
+Calibration keeps its separate 180-sample queue and half-second freshness limit.
+All runtime timing uses the monotonic clock.
+
+At startup and after tracking loss, head-pose fitting uses the saved neutral
+orientation as its initial estimate, with translation estimated from the current
+frame. This keeps startup fitting consistent with calibration while still fitting
+actual head movement. Calibration itself continues to estimate pose independently.
+Discarding healthy queued frames cancels pending gestures without restarting
+cursor recovery; discarded blink, invalid, or out-of-pose frames still pause it.
+
+If the console says live tracking is active but the cursor remains stationary,
+a persistent pause reports its reason after two seconds, at most once every five
+seconds: missing face/iris tracking, closed eyes, stale/invalid samples, pose
+mismatch, or mouse movement failure. Live tracking means workers are running;
+it does not guarantee usable gaze measurements. If the mouse library fails,
+absolute movement tries Windows SetCursorPos and reports failure if that fails too.
+
+Blinks, tracking loss, clicks, and head deviations pause movement. At least three
+open-eye samples spanning 100 ms are required before resuming; their median is
+fed into the retained filter. Short pauses discard Kalman velocity, and pauses
+over one second rebuild filter history from the last cursor position.
+Movement pauses when pitch, yaw, or roll differs by more than 10 degrees from
+calibration. Return to your calibrated posture to resume. This is a posture guard;
+full head-pose compensation is not implemented.
+
+Head tilts must persist for `hold_ms` (default 150 ms). Left tilt clicks once;
+right tilt double-clicks. Position stays frozen during tilts outside the movement
+range. Extreme roll beyond 25 degrees blocks tilt clicks until returning neutral.
+A wink must last `hold_ms` and at least `closed_eye_frames` (default 3), followed by
+both eyes being open for `click_settle_ms` (default 250 ms). It clicks only after
+this reopening period. Bilateral closure, switching eyes, loss of tracking, and
+skipped samples cancel a pending wink. Left wink clicks once; right wink
+double-clicks. Both gesture types share `cooldown_ms` (default 500 ms).
+`--freeze-duration` controls the post-click movement freeze; changing it does not
+shorten the gesture cooldown. The calibration dashboard includes a tilt-angle
+selector (default 15 degrees).
 
 The vision worker sends raw solvePnP head angles; neutral-head calibration remains
 owned by the GUI. Importing `core.vision_processor` does not open the camera or run

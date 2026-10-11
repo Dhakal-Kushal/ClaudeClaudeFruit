@@ -99,8 +99,89 @@ class EyeRelativeMeasurementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             vision_processor.normalized_iris_position(eye_landmarks()[:468], 640, 480)
 
+    def test_eyelid_vertical_compensation_unit(self):
+        from core.vision_processor import eyelid_vertical_compensation
+
+        # Neutral or upward gaze (y <= 0) must receive zero compensation
+        self.assertEqual(eyelid_vertical_compensation(0.0, 0.2, 0.1), 0.0)
+        self.assertEqual(eyelid_vertical_compensation(-0.05, 0.2, 0.1), 0.0)
+
+        # Symmetrical eyelids (asymmetry <= 0.2) receive zero compensation
+        self.assertEqual(eyelid_vertical_compensation(0.10, 0.15, 0.15), 0.0)
+        self.assertEqual(eyelid_vertical_compensation(0.10, 0.16, 0.14), 0.0)
+
+        # Degenerate or non-positive distances receive zero compensation
+        self.assertEqual(eyelid_vertical_compensation(0.10, -0.1, 0.1), 0.0)
+        self.assertEqual(eyelid_vertical_compensation(0.10, 0.1, 0.0), 0.0)
+
+        # Downward gaze with upper eyelid descent receives smooth non-linear compensation
+        comp1 = eyelid_vertical_compensation(0.05, 0.25, 0.05)
+        comp2 = eyelid_vertical_compensation(0.10, 0.25, 0.05)
+        self.assertGreater(comp1, 0.0)
+        self.assertGreater(comp2, comp1)  # scales with downward gaze depth
+
+    def test_normalized_iris_position_with_eyelid_compensation(self):
+        # In default raw mode, compensate_eyelids is False
+        raw = vision_processor.normalized_iris_position(eye_landmarks(), 640, 480)
+        raw_explicit = vision_processor.normalized_iris_position(eye_landmarks(), 640, 480, compensate_eyelids=False)
+        self.assertEqual(raw, raw_explicit)
+
+        # When looking downward with eyelid occlusion, compensation adjusts y upward
+        landmarks = eye_landmarks()
+        # Move both pupils downward by 12 pixels
+        landmarks[468].y += 12 / 480
+        landmarks[473].y += 12 / 480
+        # Lower upper eyelids partially
+        for idx in (160, 158, 387, 385):
+            landmarks[idx].y += 6 / 480
+
+        raw_down = vision_processor.normalized_iris_position(landmarks, 640, 480, compensate_eyelids=False)
+        comp_down = vision_processor.normalized_iris_position(landmarks, 640, 480, compensate_eyelids=True)
+
+        # x is unaffected
+        self.assertAlmostEqual(raw_down[0], comp_down[0])
+        # y is compensated upward (smaller positive y)
+        self.assertLess(comp_down[1], raw_down[1])
+
+
 
 class VisionProcessorTests(unittest.TestCase):
+    def test_saved_pose_seed_fits_geometry_across_restarts_and_real_pose_changes(self):
+        from core.calibration import angle_delta
+        initial = [-152.0, -5.0, 179.0]
+        matrix = np.array([[640, 0, 320], [0, 640, 240], [0, 0, 1]], dtype=float)
+        distortion = np.zeros((4, 1))
+        for mirrored in (False, True):
+            model = vision_processor.MODEL_POINTS_MIRRORED if mirrored else vision_processor.MODEL_POINTS
+            for expected, distance in ((initial, 2000), (initial, 3000),
+                                       ([-152.0, 20.0, 179.0], 2300)):
+                rotation = vision_processor.angles_to_rotation_matrix(expected)
+                rvec = vision_processor.cv2.Rodrigues(rotation)[0]
+                points = vision_processor.cv2.projectPoints(
+                    model, rvec, np.array([[20.0], [-30.0], [distance]], dtype=float),
+                    matrix, distortion)[0].reshape(-1, 2)
+                landmarks = eye_landmarks()
+                for index, point in zip(vision_processor.HEAD_INDICES, points):
+                    landmarks[index] = SimpleNamespace(x=point[0]/640, y=point[1]/480)
+                pose = vision_processor.estimate_head_pose(landmarks, 640, 480, matrix, distortion,
+                                                           mirrored=mirrored, initial_angles=initial)
+                np.testing.assert_allclose(angle_delta(pose[:3], expected), 0, atol=1e-5)
+
+    def test_saved_pose_seed_is_reused_after_tracking_loss(self):
+        initial = {"pitch": -152, "yaw": -5, "roll": 179}
+        processor = vision_processor.VisionProcessor(face_mesh=self.mesh, initial_head=initial)
+        found = SimpleNamespace(multi_face_landmarks=[SimpleNamespace(landmark=eye_landmarks())])
+        self.mesh.process.side_effect = [found, SimpleNamespace(multi_face_landmarks=None), found]
+        with patch.object(vision_processor, "estimate_head_pose", return_value=(
+            -152, -5, 179, np.zeros((3, 1)), np.ones((3, 1)))) as estimate:
+            processor.process(self.frame, self.matrix, self.distortion)
+            processor.process(self.frame, self.matrix, self.distortion)
+            processor.process(self.frame, self.matrix, self.distortion)
+        self.assertEqual(estimate.call_count, 2)
+        for call in estimate.call_args_list:
+            self.assertIsNone(call.args[5])
+            self.assertEqual(call.kwargs["initial_angles"], [-152, -5, 179])
+
     def setUp(self):
         self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
         self.matrix = np.array([[640, 0, 320], [0, 640, 240], [0, 0, 1]], dtype=float)
@@ -133,7 +214,9 @@ class VisionProcessorTests(unittest.TestCase):
                 vision_processor, "estimate_head_pose", return_value=(2, -1, 3, np.zeros((3, 1)), np.ones((3, 1)))
             ), patch.object(
                 vision_processor, "eyes_are_open", return_value=eyes_open
-            ):
+            ), patch.object(vision_processor, "estimate_head_pose", return_value=(
+                2.0, -1.0, 3.0, np.zeros((3, 1)), np.zeros((3, 1))
+            )):
                 sample = self.processor.process(self.frame, self.matrix, self.distortion, timestamp=15.0)
                 np.testing.assert_allclose((sample.eye_x, sample.eye_y), [-0.025, 0.025], atol=1e-12)
                 np.testing.assert_allclose(self.processor.last_pupil_midpoint, [294.5, 206.0])
@@ -347,6 +430,7 @@ class VisionPipelineTests(unittest.TestCase):
             pipeline.get_camera_metadata.return_value = sample_profile["camera"]
             pipeline.stop_event.is_set.side_effect = [False, False, True]
             app.main(camera_index=1)
+            self.assertEqual(pipeline_factory.call_args.kwargs["initial_head"], sample_profile["neutral_head"])
             window_factory.assert_not_called()
             pipeline.start.assert_called_once()
             pipeline.stop.assert_called_once()

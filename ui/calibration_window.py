@@ -21,7 +21,7 @@ from core.calibration import (
     profile_compatibility_errors,
     validate_camera_metadata,
 )
-from core.validation import ValidationSession
+from core.validation import ValidationSession, quality_warnings
 
 
 BACKGROUND = "#10151e"
@@ -44,10 +44,8 @@ def _physical_screen_size():
     if sys.platform.startswith("win"):
         try:
             import ctypes
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            except (AttributeError, OSError):
-                pass
+            from core.mouse_controller import init_dpi_awareness
+            init_dpi_awareness()
             user32 = ctypes.windll.user32
             return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
         except (AttributeError, OSError):
@@ -138,6 +136,11 @@ class CalibrationWindow(ctk.CTk):
         self.summary = ctk.CTkLabel(card, text="", justify="left", anchor="w", font=("Segoe UI", 15), text_color=TEXT)
         self.summary.pack(fill="x", padx=28, pady=(0, 18))
 
+        ctk.CTkLabel(card, text="Head tilt click angle", text_color=TEXT).pack(anchor="w", padx=28)
+        self.threshold = ctk.CTkOptionMenu(card, values=["12°", "15°", "18°", "20°"])
+        self.threshold.set("15°")
+        self.threshold.pack(anchor="w", padx=28, pady=(4, 8))
+
         self.tracking_label = ctk.CTkLabel(card, text="Waiting for tracking…", text_color=MUTED, font=("Segoe UI", 13))
         self.tracking_label.pack(anchor="w", padx=28, pady=(20, 4))
         self.message = ctk.CTkLabel(card, text="", wraplength=520, justify="left", anchor="w", text_color=MUTED)
@@ -179,6 +182,7 @@ class CalibrationWindow(ctk.CTk):
             self.message.configure(text="A complete calibration is needed before eye control can start.", text_color=MUTED)
 
     def start_calibration(self):
+        self.threshold.configure(state="normal")
         if self._start_id is not None:
             self.after_cancel(self._start_id)
         self._start_id = None
@@ -420,7 +424,7 @@ class CalibrationWindow(ctk.CTk):
         self.candidate_profile["validation"] = report
         self._close_stage()
         self.phase = "results"
-        lines = ["Independent validation: 8 targets (before Kalman smoothing)",
+        lines = ["Independent validation: 8 targets (before cursor smoothing)",
                  f"Median error: {report['median_error_px']:.0f} px ({report['median_error_percent_diagonal']:.2f}% of diagonal)",
                  f"90th percentile error: {report['p90_error_px']:.0f} px ({report['p90_error_percent_diagonal']:.2f}% of diagonal)",
                  f"Rejected frames: {report['rejected_sample_rate']:.1%}",
@@ -430,8 +434,16 @@ class CalibrationWindow(ctk.CTk):
         self.summary.configure(text="\n".join(lines), font=("Segoe UI", 13))
         if hasattr(self, "threshold"):
             self.threshold.configure(state="disabled")
-        self.message.configure(text="Smaller errors are better. Nothing has been saved yet. Use these results to decide whether to accept or recalibrate.", text_color=MUTED)
-        self.start_button.configure(text="Use this calibration", command=self._accept_calibration, state="normal")
+        problems = quality_warnings(report, self.monitor)
+        guidance = ("Calibration complete. Accuracy is below the suggested targets:\n" +
+                    "\n".join(problems) + "\nChoose Use anyway to try this calibration, or Retry calibration "
+                    "to improve it. Keep your head centered and still, with eyes clearly visible "
+                    "and even lighting. Check camera focus if jitter is high.")
+        self.message.configure(text=guidance if problems else
+                               "Calibration complete. Review the measured errors before accepting; smaller targets may still be difficult.",
+                               text_color="#f5b492" if problems else MUTED)
+        self.start_button.configure(text="Use anyway" if problems else "Use this calibration",
+                                    command=self._accept_calibration, state="normal")
         self.recalib_button.configure(text="Retry calibration")
         self.recalib_button.pack(fill="x", padx=28, pady=(0, 10), before=self.close_button)
         self.close_button.configure(text="Cancel")

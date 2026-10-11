@@ -35,11 +35,23 @@ class PiecewiseAffineMapping2D:
 
     Each triangle joins the center to adjacent corners. The same affine maps
     extend beyond the polygon, so callers can clamp to their display bounds.
+    Near sector boundaries (diagonal corner rays), cubic Hermite angular
+    blending transitions smoothly between adjacent triangles to eliminate
+    C^1 derivative kinks and cursor velocity jumps.
     """
 
-    def __init__(self, source_points, target_points):
+    def __init__(self, source_points, target_points, blend_width: float = 0.04):
         source = validate_calibration_points(source_points)
         target = validate_calibration_points(target_points)
+        if (
+            not isinstance(blend_width, (int, float))
+            or isinstance(blend_width, bool)
+            or not np.isfinite(blend_width)
+            or blend_width < 0.0
+            or blend_width >= 0.5
+        ):
+            raise ValueError("blend_width must be a finite float in [0.0, 0.5)")
+        self._blend_width = float(blend_width)
         self._source_center = source[4]
         self._target_center = target[4]
         self._source_scale = float(np.ptp(source[:4], axis=0).max())
@@ -62,6 +74,26 @@ class PiecewiseAffineMapping2D:
             # A sum above one extrapolates past its outer calibration edge.
             sector = int(np.argmax(weights.min(axis=1)))
             result = self._target_center + self._target_bases[sector] @ weights[sector]
+
+            if self._blend_width > 0:
+                w0, w1 = weights[sector]
+                w_sum = w0 + w1
+                if w_sum > 1e-12:
+                    q0 = max(0.0, float(w0)) / w_sum
+                    q1 = max(0.0, float(w1)) / w_sum
+                    if q0 < self._blend_width:
+                        adjacent = (sector + 1) % 4
+                        t = 0.5 * (1.0 - q0 / self._blend_width)
+                        alpha = t * t * (3.0 - 2.0 * t)
+                        adj_result = self._target_center + self._target_bases[adjacent] @ weights[adjacent]
+                        result = (1.0 - alpha) * result + alpha * adj_result
+                    elif q1 < self._blend_width:
+                        adjacent = (sector - 1) % 4
+                        t = 0.5 * (1.0 - q1 / self._blend_width)
+                        alpha = t * t * (3.0 - 2.0 * t)
+                        adj_result = self._target_center + self._target_bases[adjacent] @ weights[adjacent]
+                        result = (1.0 - alpha) * result + alpha * adj_result
+
         if not np.isfinite(result).all():
             raise ValueError("coordinates exceed the mapping's numeric range")
         return float(result[0]), float(result[1])
@@ -115,6 +147,14 @@ class KalmanFilter2D:
         """Discard tracking history after recalibration or loss of tracking."""
         self._state = None
         self._covariance = None
+        self._last_measurement = None
+        self._last_output = None
+
+    def pause(self) -> None:
+        """Keep position but discard motion through a blink or gesture."""
+        if self._state is not None:
+            self._state[:2] = self._last_output
+            self._state[2:] = 0
 
     # Update the filter with a new measurement and return the smoothed coordinates.
     def update(self, x: float, y: float, dt: float | None = None) -> tuple[float, float]:
@@ -129,6 +169,8 @@ class KalmanFilter2D:
         # if filter has just begun or has been reset, init the state and covariance
         if self._state is None:
             self._state = np.array([x, y, 0.0, 0.0], dtype=float)
+            self._last_measurement = measurement.copy()
+            self._last_output = measurement.copy()
             position_variance = self._measurement_noise
             velocity_variance = position_variance / interval**2
             self._covariance = np.diag(
@@ -167,11 +209,27 @@ class KalmanFilter2D:
         ).T
 
         # multiply the innovation by the gain and add it to the predicion.
+        previous_position = self._last_output
         self._state = predicted_state + gain @ innovation
+        # Gaze can stop abruptly. Do not let inferred velocity carry the
+        # cursor past the observation or away from it when the target changes.
+        bounded = np.clip(self._state[:2], np.minimum(previous_position, measurement),
+                          np.maximum(previous_position, measurement))
+        constrained = bounded != self._state[:2]
+        # A noisy observation can cross a moving estimate. Retain velocity
+        # unless successive observations also indicate a stopped target.
+        if np.linalg.norm(measurement - self._last_measurement) < 1e-6:
+            self._state[2:][constrained] = 0
+            self._state[:2] = bounded
+        elif constrained.any():
+            max_dev = 2.0 * np.sqrt(self._measurement_noise)
+            self._state[:2] = np.clip(self._state[:2], bounded - max_dev, bounded + max_dev)
+        self._last_measurement = measurement.copy()
+        self._last_output = bounded.copy()
         residual = np.eye(4) - gain @ self._observation
         self._covariance = (
             residual @ predicted_covariance @ residual.T
             + gain @ self._measurement_covariance @ gain.T
         )
         self._covariance = 0.5 * (self._covariance + self._covariance.T)
-        return float(self._state[0]), float(self._state[1])
+        return float(bounded[0]), float(bounded[1])

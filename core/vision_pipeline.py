@@ -11,14 +11,14 @@ from core.vision_processor import VisionProcessor, process_frames
 
 class VisionPipeline:
     def __init__(self, adapter, camera_index=0, camera_factory=None, processor_factory=None,
-                 freeze_duration=0.5, *, capture_settings=None, expected_camera=None):
+                 freeze_duration=0.5, *, capture_settings=None, expected_camera=None, initial_head=None):
         self.adapter = adapter
         self.camera_index = camera_index
         self.camera_factory = camera_factory if camera_factory is not None else Camera
         self.capture_settings = dict(capture_settings or {})
         self.expected_camera = dict(expected_camera) if expected_camera else None
         self.processor_factory = processor_factory or partial(
-            VisionProcessor, mirrored=self.capture_settings.get("flip", True)
+            VisionProcessor, mirrored=self.capture_settings.get("flip", True), initial_head=initial_head
         )
         self.freeze_duration = freeze_duration
         self.frames = Queue(maxsize=2)

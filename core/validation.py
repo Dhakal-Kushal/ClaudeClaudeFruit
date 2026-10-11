@@ -5,8 +5,30 @@ from time import monotonic
 
 import numpy as np
 
-from core.calibration import angle_delta, validate_profile
+from core.calibration import angle_delta, compensate_head_pose, validate_profile
 from core.gaze_mapper import GazeMapper
+
+
+def quality_warnings(report, monitor):
+    """Advisory accuracy targets, not calibrated hardware acceptance limits.
+
+    Evaluate held-out raw mapping errors, so smoothing cannot hide systematic
+    bias. Show these in the UI; complete, explicitly accepted reports remain
+    usable even when a webcam cannot meet these targets.
+    """
+    diagonal = float(np.hypot(monitor["width"], monitor["height"]))
+    errors = []
+    for key, fraction, label in (("median_error_px", .025, "Median error"),
+                                  ("p90_error_px", .05, "90th-percentile error")):
+        if report[key] > diagonal * fraction:
+            errors.append(f"{label} {report[key]:.0f} px exceeds {diagonal * fraction:.0f} px")
+    for index, target in enumerate(report["targets"], 1):
+        bias = float(np.linalg.norm(target["bias_px"]))
+        if bias > diagonal * .03:
+            errors.append(f"Target {index} bias {bias:.0f} px exceeds {diagonal * .03:.0f} px")
+        if target["rms_jitter_px"] > diagonal * .02:
+            errors.append(f"Target {index} jitter {target['rms_jitter_px']:.0f} px exceeds {diagonal * .02:.0f} px")
+    return errors
 
 
 def validation_targets(monitor):
@@ -37,6 +59,10 @@ class ValidationSession:
         self.accepted_samples = 0
         self.rejected_samples = 0
         self._last_seen = None
+        pose_settings = self.profile.get("head_pose_compensation", {}) if isinstance(self.profile, dict) else {}
+        self.head_pose_compensation = pose_settings.get("enabled", True)
+        self.yaw_gain = float(pose_settings.get("yaw_gain", 0.007))
+        self.pitch_gain = float(pose_settings.get("pitch_gain", 0.007))
         self.interrupt()
 
     @property
@@ -92,7 +118,13 @@ class ValidationSession:
             self.interrupt()
             self.status = "Keep your head still - trying again"
             return
-        point = self.mapper.map_coordinates(sample.eye_x, sample.eye_y)
+        eye_x, eye_y = sample.eye_x, sample.eye_y
+        if self.head_pose_compensation:
+            eye_x, eye_y = compensate_head_pose(
+                eye_x, eye_y, sample.pitch, sample.yaw,
+                self.profile["neutral_head"], yaw_gain=self.yaw_gain, pitch_gain=self.pitch_gain
+            )
+        point = self.mapper.map_coordinates(eye_x, eye_y)
         self.samples.append((sample.timestamp, point))
         self.progress = min((sample.timestamp - self.samples[0][0]) / self.capture_seconds, 1.0)
         self.status = "Measuring accuracy - keep looking at the dot"

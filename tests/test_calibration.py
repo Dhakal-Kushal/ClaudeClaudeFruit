@@ -92,7 +92,7 @@ class CalibrationTests(unittest.TestCase):
             if name != "neutral_head":
                 np.testing.assert_allclose(profile["eye_targets"][name], eye)
         np.testing.assert_allclose(list(profile["neutral_head"].values()), [2, -1, 3])
-        self.assertEqual(profile["screen_targets"]["top_left"], [24, 24])
+        self.assertEqual(profile["screen_targets"]["top_left"], [154, 86])
         self.assertEqual(profile["mapping"]["method"], "piecewise_affine_v1")
 
     def test_old_profile_requires_validation_without_mutating_file(self):
@@ -200,11 +200,29 @@ class CalibrationTests(unittest.TestCase):
         area = {"width": 1904, "height": 1017, "x": 8, "y": 31}
         session.screen_positions = screen_targets(area)
         profile = validated_profile(session.build_profile())
-        self.assertEqual(profile["screen_targets"]["top_left"], [32, 55])
+        self.assertEqual(profile["screen_targets"]["top_left"], [160, 112])
         with TemporaryDirectory() as directory:
             path = Path(directory) / "calibration.json"
             save_profile(path, profile)
             self.assertEqual(load_profile(path, MONITOR)["screen_targets"], screen_targets(area))
+
+    def test_screen_targets_insets(self):
+        # Default ~8% inset
+        targets = screen_targets(MONITOR)
+        self.assertEqual(targets["top_left"], [154, 86])
+        self.assertEqual(targets["bottom_right"], [1765, 993])
+
+        # Custom scalar pixel inset
+        targets_24 = screen_targets(MONITOR, inset=24)
+        self.assertEqual(targets_24["top_left"], [24, 24])
+
+        # Custom tuple (x, y) inset
+        targets_xy = screen_targets(MONITOR, inset=(100, 50))
+        self.assertEqual(targets_xy["top_left"], [100, 50])
+
+        # Custom float percentage inset (e.g. 10%)
+        targets_pct = screen_targets(MONITOR, inset=0.10)
+        self.assertEqual(targets_pct["top_left"], [192, 108])
 
     def test_canvas_targets_map_to_monitor_coordinates_at_scaled_resolution(self):
         width, height = 1707, 950
@@ -240,6 +258,54 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(adapter.samples.qsize(), 180)
         self.assertEqual(adapter.samples.get_nowait().eye_x, 70)
 
+    def test_compensate_head_pose(self):
+        from core.calibration import compensate_head_pose
+        # Neutral posture should yield identical coordinates
+        cx, cy = compensate_head_pose(0.5, 0.5, 2.0, -1.0, {"pitch": 2.0, "yaw": -1.0})
+        self.assertAlmostEqual(cx, 0.5)
+        self.assertAlmostEqual(cy, 0.5)
+
+        # Head turning right (yaw +5 deg) should shift gaze rightward by yaw_gain * 5.0
+        cx, cy = compensate_head_pose(0.5, 0.5, 2.0, 4.0, {"pitch": 2.0, "yaw": -1.0}, yaw_gain=0.007)
+        self.assertAlmostEqual(cx, 0.5 + 0.007 * 5.0)
+        self.assertAlmostEqual(cy, 0.5)
+
+        # Head tilting down (pitch +4 deg) should shift gaze downward by pitch_gain * 4.0
+        cx, cy = compensate_head_pose(0.5, 0.5, 6.0, -1.0, {"pitch": 2.0, "yaw": -1.0}, pitch_gain=0.007)
+        self.assertAlmostEqual(cx, 0.5)
+        self.assertAlmostEqual(cy, 0.5 + 0.007 * 4.0)
+
+        # Works with sequence neutral_head (pitch, yaw, roll)
+        cx, cy = compensate_head_pose(0.5, 0.5, 5.0, 3.0, (2.0, -1.0, 0.0), yaw_gain=0.01, pitch_gain=0.02)
+        self.assertAlmostEqual(cx, 0.5 + 0.01 * 4.0)
+        self.assertAlmostEqual(cy, 0.5 + 0.02 * 3.0)
+
+    def test_head_pose_compensation_profile_validation(self):
+        session = completed_session()
+        profile = session.build_profile()
+        self.assertIn("head_pose_compensation", profile)
+        self.assertTrue(profile["head_pose_compensation"]["enabled"])
+        self.assertEqual(profile["head_pose_compensation"]["yaw_gain"], 0.007)
+        self.assertEqual(profile["head_pose_compensation"]["pitch_gain"], 0.007)
+
+        # Negative or non-numeric gains or non-dict structures must be rejected
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            bad_cases = [
+                {"head_pose_compensation": "invalid"},
+                {"head_pose_compensation": {"enabled": "yes"}},
+                {"head_pose_compensation": {"yaw_gain": -0.01}},
+                {"head_pose_compensation": {"pitch_gain": float("nan")}},
+                {"head_pose_compensation": {"pitch_gain": True}},
+            ]
+            for case in bad_cases:
+                with self.subTest(case=case):
+                    invalid = copy.deepcopy(profile)
+                    invalid.update(case)
+                    path.write_text(json.dumps(invalid))
+                    self.assertIsNone(load_profile(path))
+
 
 if __name__ == "__main__":
     unittest.main()
+

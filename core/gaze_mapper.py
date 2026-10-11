@@ -8,9 +8,11 @@ class GazeMapper:
     def __init__(self, profile):
         self.eye = profile["eye_targets"]
         self.screen = profile["screen_targets"]
+        blend_width = profile.get("mapping", {}).get("blend_width", 0.04)
         self._mapping = PiecewiseAffineMapping2D(
             [self.eye[name] for name in EYE_TARGETS],
             [self.screen[name] for name in EYE_TARGETS],
+            blend_width=blend_width,
         )
         monitor = profile.get("monitor", {})
         if "width" in monitor and "height" in monitor:

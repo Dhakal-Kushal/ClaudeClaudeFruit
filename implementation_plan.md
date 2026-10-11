@@ -1,4 +1,74 @@
-# Implementation Plan: Fix Code Review Issues
+# Cursor tracking repair plan (2026-10-11)
+
+1. Calibration accuracy: show advisory median <= 2.5% and p90 <= 5% of display
+   diagonal, with per-target bias <= 3% and RMS jitter <= 2%. Offer Use anyway
+   or Retry calibration. Only malformed/incomplete data, invalid geometry and
+   camera/display mismatches block persistence/reuse. Accuracy targets are not
+   empirically validated hardware limits and must not force repeated calibration.
+   Never rewrite measured results or fit to held-out targets.
+2. Smoothing selection: instantiate the requested Kalman or moving-average
+   filter and honor its parameters; reject unknown methods.
+3. Overshoot: constrain Kalman outputs between the previous output and current
+   measurement. Retain the internal motion estimate on noisy observations; clear
+   constrained velocity when successive observations show a stopped target.
+   Preserve Joseph covariance updates and symmetry.
+4. Blinks: freeze on closure, preserve position history, remove velocity,
+   and collect at least three open samples over 100 ms before resuming from
+   their median. Reinitialize long-loss history from the last cursor position.
+5. Freshness: use monotonic time; reject samples older than 250 ms, future
+   samples beyond 50 ms, duplicates, and out-of-order samples. Use a small
+   live queue and drain backlogs with gesture/reacquisition reset.
+6. Head pose: use the calibration's 10-degree limit for live pitch/yaw/roll
+   movement. Tilt gestures operate while position is frozen, provided
+   pitch/yaw remain in range. Resume after stable open-eye samples.
+7. Gestures: honor hold duration, minimum closed frames, reopening settle
+   duration, and shared cooldown. Cancel winks on bilateral closure, tracking
+   loss, or skipped frames. Fire qualified winks after confirmed reopening.
+8. Calibration UI: restore the tilt threshold control, preserve retry/cancel/
+   save behavior, and repair the pose test's missing mock.
+
+Verification: synthetic regressions with a mocked mouse for both filter modes,
+accuracy limits and persistence, full UI flow, full unittest suite, diff checks.
+Real accuracy requires a fresh webcam calibration and independent validation.
+
+## Completion and verification
+
+All eight software changes implemented. The full suite passes 132 tests,
+including step responses at 15/20/30/60 FPS, both smoothing modes, stale input,
+blink recovery, sustained gestures, pose gating, calibration quality/persistence,
+and UI acceptance/retry/cancel flows. The missing pose-test mock was repaired.
+The existing user-modified calibration profile was not edited; its recorded
+errors exceed advisory accuracy targets but no longer prevent explicit use or reuse.
+
+## Follow-up: repeated calibration rejection
+
+The initial hard accuracy gates caused repeated rejection of complete webcam
+calibrations. Removed those gates from persistence and runtime validation;
+the results UI now offers Use anyway with measured-error warnings. Regression
+tests cover explicit acceptance, unchanged measurements, save/load/startup,
+retry, and continued rejection of malformed/incomplete validation.
+
+## Follow-up: intermittent startup freeze
+
+Reproduced startup recovery starvation when every cursor iteration skipped a
+fresh queued frame: the recovery buffer was cleared on each iteration. Healthy
+skips now cancel gesture continuity without resetting movement recovery. Skipped
+blink, invalid, and out-of-pose samples retain their pause behavior.
+
+Tracking pose fitting now starts from the saved neutral rotation with current
+frame translation, and reuses this seed on reacquisition. Calibration is unseeded;
+genuine head deviations still block movement. Persistent blocks print actionable
+reasons after two seconds, with a five-second log rate limit. Mouse-library failure
+tries Windows SetCursorPos, and failed input delivery does not update held position.
+
+Verification covers the previously failing backlog reproduction, skipped blinks,
+no-frame startup, pose diagnostics, mocked backend failures, seeded synthetic
+pose geometry (mirrored/unmirrored, changed distance and actual head movement),
+and initialization after tracking loss. Full suite: 140 tests. No live webcam
+or physical cursor input was used for tests; the reported symptom needs a live
+retry to confirm which of these failure paths occurred on the user's system.
+
+# Historical implementation plan
 
 ## Step 1: Fix Critical Severity Issues
 - [x] **Issue 1.1**: Added `import math` and `import numpy as np` to `core/gaze_mapper.py`.
