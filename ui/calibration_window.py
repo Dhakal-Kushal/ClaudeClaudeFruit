@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from queue import Empty
 from time import monotonic
@@ -32,6 +33,22 @@ STEP_LABELS = {
 }
 
 
+def _physical_screen_size():
+    """Return (width, height) in physical pixels on Windows, else None."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except (AttributeError, OSError):
+                pass
+            user32 = ctypes.windll.user32
+            return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        except (AttributeError, OSError):
+            pass
+    return None
+
+
 class CalibrationWindow(ctk.CTk):
     def __init__(
         self,
@@ -54,7 +71,11 @@ class CalibrationWindow(ctk.CTk):
         self.coordinate_space = coordinate_space
         self.pipeline_errors = pipeline_errors
         self._pipeline_error = None
-        self.monitor = {"width": self.winfo_screenwidth(), "height": self.winfo_screenheight(), "x": 0, "y": 0}
+        physical = _physical_screen_size()
+        if physical:
+            self.monitor = {"width": physical[0], "height": physical[1], "x": 0, "y": 0}
+        else:
+            self.monitor = {"width": self.winfo_screenwidth(), "height": self.winfo_screenheight(), "x": 0, "y": 0}
         self.profile = load_profile(self.profile_path, self.monitor)
         if self.profile and (
             self.profile["mapping"]["coordinate_space"] != coordinate_space
@@ -65,17 +86,22 @@ class CalibrationWindow(ctk.CTk):
         self.stage = None
         self.last_sample = None
         self._closed = False
+        self.cancelled = False
+        self._auto_start = auto_start
         self._poll_id = None
         self._start_id = None
         self._fullscreen_id = None
-        self._maximize_id = self.after(0, self._maximize_window)
-        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._maximize_id = None
+        self.protocol("WM_DELETE_WINDOW", self._cancel_and_close)
         self.bind("<Escape>", lambda event: self.cancel_calibration())
         self._build_dashboard()
         self._refresh_dashboard()
         self._poll_id = self.after(40, self._poll_tracking)
-        if auto_start and self.profile is None:
-            self._start_id = self.after(350, self.start_calibration)
+        if auto_start:
+            self.withdraw()
+            self._start_id = self.after(0, self.start_calibration)
+        else:
+            self._maximize_id = self.after(0, self._maximize_window)
 
     def _maximize_window(self):
         self._maximize_id = None
@@ -114,18 +140,35 @@ class CalibrationWindow(ctk.CTk):
             fg_color=ACCENT, hover_color="#43bea2", text_color=BACKGROUND,
             font=("Segoe UI", 15, "bold"), height=44,
         )
-        self.start_button.pack(fill="x", padx=28, pady=(0, 12))
-        ctk.CTkButton(card, text="Close", command=self.close, fg_color="transparent", border_width=1, border_color="#405169", height=34).pack(fill="x", padx=28, pady=(0, 24))
+        self.start_button.pack(fill="x", padx=28, pady=(0, 10))
+        self.recalib_button = ctk.CTkButton(
+            card, text="Redo calibration", command=self.start_calibration,
+            fg_color="transparent", border_width=1, border_color="#405169",
+            text_color=TEXT, hover_color="#273447", font=("Segoe UI", 14), height=38,
+        )
+        self.close_button = ctk.CTkButton(
+            card, text="Exit", command=self._cancel_and_close,
+            fg_color="transparent", text_color=MUTED, hover_color="#212d3d", height=30,
+        )
+        self.close_button.pack(fill="x", padx=28, pady=(0, 24))
+
+    def _cancel_and_close(self):
+        self.cancelled = True
+        self.close()
 
     def _refresh_dashboard(self):
         resolution = f"Primary display · {self.monitor['width']} × {self.monitor['height']}"
         if self.profile:
             self.summary.configure(text=f"{resolution}\n\n✓ Five eye positions captured\n✓ Neutral head position recorded\n✓ Calibration saved")
-            self.start_button.configure(text="Redo calibration")
-            self.message.configure(text="Your saved calibration is ready.", text_color=ACCENT)
+            self.start_button.configure(text="Start tracking", command=self.close)
+            self.recalib_button.pack(fill="x", padx=28, pady=(0, 10), before=self.close_button)
+            self.close_button.configure(text="Exit")
+            self.message.configure(text="Your saved calibration is ready. Click Start Tracking to begin.", text_color=ACCENT)
         else:
             self.summary.configure(text=f"{resolution}\n\nSix short tests · About 25 seconds\nPress Esc at any time to cancel.")
-            self.start_button.configure(text="Start calibration")
+            self.start_button.configure(text="Start calibration", command=self.start_calibration)
+            self.recalib_button.pack_forget()
+            self.close_button.configure(text="Exit")
             self.message.configure(text="A complete calibration is needed before eye control can start.", text_color=MUTED)
 
     def start_calibration(self):
@@ -137,7 +180,7 @@ class CalibrationWindow(ctk.CTk):
         self.session = CalibrationSession(self.monitor)
         self.stage = tk.Toplevel(self, bg=BACKGROUND)
         self.stage.withdraw()
-        self.stage.protocol("WM_DELETE_WINDOW", self.close)
+        self.stage.protocol("WM_DELETE_WINDOW", self._cancel_and_close)
         self.stage.bind("<Escape>", lambda event: self.cancel_calibration())
         self.canvas = tk.Canvas(self.stage, bg=BACKGROUND, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -176,7 +219,12 @@ class CalibrationWindow(ctk.CTk):
         self.canvas.create_oval(x - 20, y - 20, x + 20, y + 20, outline="#345c58", width=2)
         self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9, fill=ACCENT, outline="")
         self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=TEXT, outline="")
-        text_y = height * (0.7 if step in ("neutral_head", "center") else 0.44)
+        if step in ("neutral_head", "center"):
+            text_y = height * 0.15
+        elif y < height / 2:
+            text_y = height * 0.75
+        else:
+            text_y = height * 0.25
         self.canvas.create_text(width / 2, text_y, text=STEP_LABELS[step], fill=TEXT, font=("Segoe UI", 23, "bold"), width=width - 100)
         self.canvas.create_text(width / 2, text_y + 48, text=self.session.status, fill=ACCENT, font=("Segoe UI", 15), width=width - 100)
         bar_width = min(280, width - 100)
@@ -246,9 +294,11 @@ class CalibrationWindow(ctk.CTk):
             self.tracking_label.configure(text="Tracking connected", text_color=ACCENT)
         if self.session is not None and self.session.complete:
             self._finish_calibration()
+            return
         else:
             self._draw_stage()
-        self._poll_id = self.after(40, self._poll_tracking)
+        if not self._closed:
+            self._poll_id = self.after(40, self._poll_tracking)
 
     def _finish_calibration(self):
         try:
@@ -264,7 +314,7 @@ class CalibrationWindow(ctk.CTk):
             return
         self.profile = profile
         self._close_stage()
-        self._refresh_dashboard()
+        self.close()
 
     def _close_stage(self):
         if self._fullscreen_id is not None:
@@ -272,8 +322,9 @@ class CalibrationWindow(ctk.CTk):
             self._fullscreen_id = None
         if self.stage is not None:
             self.stage.destroy()
-            self.deiconify()
-            self.state("zoomed")
+            if not getattr(self, "_auto_start", False):
+                self.deiconify()
+                self.state("zoomed")
         self.stage = None
         self.session = None
         self.start_button.configure(state="normal")
@@ -281,9 +332,15 @@ class CalibrationWindow(ctk.CTk):
         self.focus_force()
 
     def cancel_calibration(self):
-        if self.stage is not None:
-            self._close_stage()
-            self.message.configure(text="Calibration cancelled. You can start again when ready.", text_color=MUTED)
+        self.cancelled = True
+        if getattr(self, "_auto_start", False):
+            self.close()
+        else:
+            if self.stage is not None:
+                self._close_stage()
+                self.message.configure(text="Calibration cancelled. You can start again when ready.", text_color=MUTED)
+            else:
+                self.close()
 
     def close(self):
         self._closed = True

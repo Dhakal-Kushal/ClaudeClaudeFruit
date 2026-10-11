@@ -1,10 +1,89 @@
+import subprocess
 import sys
 
 import cv2
 import numpy as np
 
 
+def get_friendly_camera_names():
+    """Retrieve friendly hardware names for camera devices on Windows."""
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        ps_cmd = (
+            'Get-CimInstance Win32_PnPEntity | '
+            'Where-Object { $_.PNPClass -eq "Camera" -or $_.PNPClass -eq "Image" } | '
+            'ForEach-Object { $_.Name }'
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def list_available_cameras(max_to_test=6):
+    """Scan and return a list of available webcams with index, name, and resolution.
+
+    Returns:
+        List of dicts: [{'index': int, 'name': str, 'width': int, 'height': int, 'label': str}, ...]
+    """
+    try:
+        old_level = cv2.utils.logging.getLogLevel()
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        old_level = None
+
+    friendly_names = get_friendly_camera_names()
+    cameras = []
+
+    try:
+        for index in range(max_to_test):
+            backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                continue
+
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            success, test_frame = cap.read()
+            if success and test_frame is not None and (w <= 0 or h <= 0):
+                h, w = test_frame.shape[:2]
+            cap.release()
+
+            if index < len(friendly_names):
+                name = friendly_names[index]
+            else:
+                name = f"Webcam {index}"
+
+            res_str = f" ({w}x{h})" if w > 0 and h > 0 else ""
+            label = f"Camera {index}: {name}{res_str}"
+            cameras.append({
+                "index": index,
+                "name": name,
+                "width": w,
+                "height": h,
+                "label": label,
+            })
+    finally:
+        if old_level is not None:
+            try:
+                cv2.utils.logging.setLogLevel(old_level)
+            except Exception:
+                pass
+
+    return cameras
+
+
 class Camera:
+    @classmethod
+    def list_available_cameras(cls, max_to_test=6):
+        return list_available_cameras(max_to_test)
+
     def __init__(self, index=0, width=None, height=None, flip=True):
 
         self._cap = cv2.VideoCapture(index)
@@ -22,6 +101,10 @@ class Camera:
         self.flip = flip
         self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if self.width <= 0 or self.height <= 0:
+            success, test_frame = self._cap.read()
+            if success and test_frame is not None:
+                self.height, self.width = test_frame.shape[:2]
 
         # Approximate intrinsics for solvePnP (focal length ~ image width, center
         # principal point). Ignore these if you don't need them.
