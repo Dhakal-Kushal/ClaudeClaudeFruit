@@ -143,7 +143,7 @@ class VisionProcessor:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self, exc_type=None, exc=None, traceback=None):
         self.close()
 
 

@@ -85,7 +85,10 @@ class MouseController:
             self.mouse.move(int(smooth_x), int(smooth_y), absolute=True)
 
         d_roll = angle_delta([sample.roll], [self.neutral_roll])[0]
+        self.headClick(d_roll)
 
+    def headClick(self, d_roll):
+        current_time = time.time()
         if not self.debounce_flag:
             if self.tilt_threshold < d_roll <= self.max_roll_degrees:
                 self.mouse.double_click("left")
