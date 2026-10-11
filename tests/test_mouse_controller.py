@@ -115,60 +115,17 @@ class MouseControllerTests(unittest.TestCase):
         self.controller.update(sample)
         self.mock_mouse.move.assert_called_with(960, 540, absolute=True)
 
-    def test_left_tilt_triggers_single_click_and_freezes_movement(self):
+    def test_head_tilt_does_not_click(self):
         sample_tilt = CalibrationSample(300.0, 200.0, 0.0, 0.0, -18.0, timestamp=time.time())
         self.controller.update(sample_tilt)
-        self.mock_mouse.click.assert_called_once_with("left")
-        self.mock_mouse.double_click.assert_not_called()
-        self.assertTrue(self.controller.debounce_flag)
-
-        self.mock_mouse.move.reset_mock()
-        sample_move = CalibrationSample(250.0, 150.0, 0.0, 0.0, -18.0, timestamp=time.time())
-        self.controller.update(sample_move)
-        self.mock_mouse.move.assert_not_called()
-
-    def test_right_tilt_triggers_double_click_and_freezes_movement(self):
-        sample_tilt = CalibrationSample(300.0, 200.0, 0.0, 0.0, 18.0, timestamp=time.time())
-        self.controller.update(sample_tilt)
-        self.mock_mouse.double_click.assert_called_once_with("left")
-        self.mock_mouse.click.assert_not_called()
-        self.assertTrue(self.controller.debounce_flag)
-
-        self.mock_mouse.move.reset_mock()
-        sample_move = CalibrationSample(250.0, 150.0, 0.0, 0.0, 18.0, timestamp=time.time())
-        self.controller.update(sample_move)
-        self.mock_mouse.move.assert_not_called()
-
-    def test_extreme_tilt_does_not_click(self):
-        sample_extreme = CalibrationSample(300.0, 200.0, 0.0, 0.0, 35.0, timestamp=time.time())
-        self.controller.update(sample_extreme)
         self.mock_mouse.click.assert_not_called()
         self.mock_mouse.double_click.assert_not_called()
-        self.assertTrue(self.controller.debounce_flag)
 
-    def test_extreme_tilt_returning_past_threshold_does_not_click(self):
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 35.0, timestamp=time.time()))
+        sample_tilt_right = CalibrationSample(300.0, 200.0, 0.0, 0.0, 18.0, timestamp=time.time())
+        self.controller.update(sample_tilt_right)
         self.mock_mouse.click.assert_not_called()
         self.mock_mouse.double_click.assert_not_called()
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 18.0, timestamp=time.time()))
-        self.mock_mouse.click.assert_not_called()
-        self.mock_mouse.double_click.assert_not_called()
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 5.0, timestamp=time.time()))
-        self.assertFalse(self.controller.debounce_flag)
 
-    def test_debounce_resets_after_head_straightens(self):
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, -16.0, timestamp=time.time()))
-        self.assertEqual(self.mock_mouse.click.call_count, 1)
-
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, -17.0, timestamp=time.time()))
-        self.assertEqual(self.mock_mouse.click.call_count, 1)
-
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, -5.0, timestamp=time.time()))
-        self.assertFalse(self.controller.debounce_flag)
-
-        self.controller.last_click_time = 0
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 16.0, timestamp=time.time()))
-        self.assertEqual(self.mock_mouse.double_click.call_count, 1)
 
     def test_kalman_filter_smooths_jitter(self):
         t = 100.0
@@ -228,13 +185,3 @@ class MouseControllerTests(unittest.TestCase):
         self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, 0.0, timestamp=time.time(), right_winking=True))
         self.assertEqual(self.mock_mouse.double_click.call_count, 1)
 
-    def test_wink_and_head_tilt_debounce_are_independent(self):
-        # Head tilt sets debounce_flag
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, -18.0, timestamp=time.time()))
-        self.assertTrue(self.controller.debounce_flag)
-        self.assertFalse(self.controller.wink_debounce_flag)
-
-        # Frame with head still tilted and no wink should NOT reset head tilt debounce
-        self.controller.update(CalibrationSample(300.0, 200.0, 0.0, 0.0, -18.0, timestamp=time.time(), left_winking=False, right_winking=False))
-        self.assertTrue(self.controller.debounce_flag)
-        self.assertEqual(self.mock_mouse.click.call_count, 1)

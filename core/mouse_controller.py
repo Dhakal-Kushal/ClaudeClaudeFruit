@@ -10,7 +10,6 @@ try:
 except ImportError:
     mouse = None
 
-from core.calibration import angle_delta
 from core.gaze_mapper import GazeMapper
 from core.math_filters import KalmanFilter2D
 
@@ -28,9 +27,6 @@ class MouseController:
             self.mapper = None
 
         settings = profile.get("gesture_settings", {})
-        self.tilt_threshold = settings.get("trigger_degrees", 15.0)
-        self.reset_threshold = settings.get("release_degrees", 7.5)
-        self.max_roll_degrees = settings.get("max_roll_degrees", 25.0)
         cooldown = settings.get("cooldown_ms", 500)
         self.freeze_duration = (cooldown / 1000.0) if cooldown else freeze_duration
         self.sensitivity = 30
@@ -43,16 +39,12 @@ class MouseController:
             self.screen_w = 1920
             self.screen_h = 1080
 
-        neutral = profile.get("neutral_head", {})
-        self.neutral_roll = neutral.get("roll", 0.0)
-
         smoothing = profile.get("smoothing", {})
         process_noise = smoothing.get("process_noise", 10000.0)
         measurement_noise = smoothing.get("measurement_noise", 25.0)
         self.kalman = KalmanFilter2D(process_noise=process_noise, measurement_noise=measurement_noise)
         self.last_click_time = 0.0
         self.last_sample_time = None
-        self.debounce_flag = False
         self.wink_debounce_flag = False
         self.freeze_pos = None
         self.stop_event = Event()
@@ -164,38 +156,10 @@ class MouseController:
         else:
             smooth_x, smooth_y = sample.eye_x, sample.eye_y
 
-        d_roll = angle_delta([sample.roll], [self.neutral_roll])[0]
-        self.headClick(d_roll)
         self.winkClick(getattr(sample, "left_winking", False), getattr(sample, "right_winking", False))
 
         if not self.is_frozen and self.mapper is not None:
             self.move(int(smooth_x), int(smooth_y), absolute=True)
-
-    def headClick(self, d_roll):
-        current_time = time.time()
-        if abs(d_roll) > self.max_roll_degrees:
-            self.debounce_flag = True
-            return
-
-        if not self.debounce_flag:
-            if self.tilt_threshold < d_roll <= self.max_roll_degrees:
-                try:
-                    self.freeze_pos = self.mouse.get_position()
-                except Exception:
-                    self.freeze_pos = None
-                self.mouse.double_click("left")
-                self.last_click_time = current_time
-                self.debounce_flag = True
-            elif -self.max_roll_degrees <= d_roll < -self.tilt_threshold:
-                try:
-                    self.freeze_pos = self.mouse.get_position()
-                except Exception:
-                    self.freeze_pos = None
-                self.mouse.click("left")
-                self.last_click_time = current_time
-                self.debounce_flag = True
-        elif abs(d_roll) < self.reset_threshold:
-            self.debounce_flag = False
 
     def winkClick(self, left_winking, right_winking):
         current_time = time.time()

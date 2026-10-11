@@ -121,16 +121,7 @@ class CalibrationWindow(ctk.CTk):
         ).pack(anchor="w", padx=28, pady=(12, 20))
         self.summary = ctk.CTkLabel(card, text="", justify="left", anchor="w", font=("Segoe UI", 15), text_color=TEXT)
         self.summary.pack(fill="x", padx=28, pady=(0, 18))
-        threshold_row = ctk.CTkFrame(card, fg_color="transparent")
-        threshold_row.pack(fill="x", padx=28)
-        ctk.CTkLabel(threshold_row, text="Head gesture threshold", font=("Segoe UI", 14)).pack(side="left")
-        value = self.profile["gesture_settings"]["trigger_degrees"] if self.profile else 15
-        self.threshold = ctk.CTkOptionMenu(
-            threshold_row, values=["10°", "15°", "20°"], width=100,
-            fg_color="#2b394d", button_color="#344960", button_hover_color="#426079",
-        )
-        self.threshold.set(f"{value:g}°")
-        self.threshold.pack(side="right")
+
         self.tracking_label = ctk.CTkLabel(card, text="Waiting for tracking…", text_color=MUTED, font=("Segoe UI", 13))
         self.tracking_label.pack(anchor="w", padx=28, pady=(20, 4))
         self.message = ctk.CTkLabel(card, text="", wraplength=520, justify="left", anchor="w", text_color=MUTED)
@@ -191,7 +182,6 @@ class CalibrationWindow(ctk.CTk):
         self.stage.focus_force()
         self._fullscreen_id = self.after(100, self._enter_stage_fullscreen, self.stage)
         self.start_button.configure(state="disabled")
-        self.threshold.configure(state="disabled")
         self._draw_stage()
 
     def _enter_stage_fullscreen(self, stage):
@@ -303,7 +293,6 @@ class CalibrationWindow(ctk.CTk):
     def _finish_calibration(self):
         try:
             profile = self.session.build_profile(
-                trigger_degrees=float(self.threshold.get().rstrip("°")),
                 camera=self.camera_metadata,
                 coordinate_space=self.coordinate_space,
             )
@@ -328,7 +317,6 @@ class CalibrationWindow(ctk.CTk):
         self.stage = None
         self.session = None
         self.start_button.configure(state="normal")
-        self.threshold.configure(state="normal")
         self.focus_force()
 
     def cancel_calibration(self):
